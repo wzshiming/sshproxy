@@ -66,25 +66,25 @@ func serverConfig(addr string) (host string, config *ssh.ServerConfig, err error
 	}
 
 	hostkeyFiles := ur.Query()["hostkey_file"]
-	for _, ident := range hostkeyFiles {
-		if ident == "" {
-			continue
+	if len(hostkeyFiles) == 0 {
+		key, err := sshd.RandomHostkey()
+		if err != nil {
+			return "", nil, err
 		}
-		if strings.HasPrefix(ident, "~") {
-			home, err := os.UserHomeDir()
-			if err == nil {
-				ident = filepath.Join(home, ident[1:])
+		config.AddHostKey(key)
+	} else {
+		for _, ident := range hostkeyFiles {
+			if ident == "" {
+				continue
 			}
-		}
+			if strings.HasPrefix(ident, "~") {
+				home, err := os.UserHomeDir()
+				if err == nil {
+					ident = filepath.Join(home, ident[1:])
+				}
+			}
 
-		if ident != "" {
 			key, err := sshd.GetHostkey(ident)
-			if err != nil {
-				return "", nil, err
-			}
-			config.AddHostKey(key)
-		} else {
-			key, err := sshd.RandomHostkey()
 			if err != nil {
 				return "", nil, err
 			}
@@ -114,6 +114,10 @@ func serverConfig(addr string) (host string, config *ssh.ServerConfig, err error
 			}
 			return nil, fmt.Errorf("denied")
 		}
+	}
+
+	if config.PasswordCallback == nil && config.PublicKeyCallback == nil && config.KeyboardInteractiveCallback == nil {
+		config.NoClientAuth = true
 	}
 
 	host = ur.Hostname()
