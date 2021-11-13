@@ -17,6 +17,7 @@ The following is the implementation of other proxy protocols
 - [HTTP Proxy](https://github.com/wzshiming/httpproxy)
 - [Shadow Socks](https://github.com/wzshiming/shadowsocks)
 - [Any Proxy](https://github.com/wzshiming/anyproxy)
+- [Emux](https://github.com/wzshiming/emux)
 
 ## Usage
 
