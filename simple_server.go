@@ -25,7 +25,7 @@ type SimpleServer struct {
 
 // NewSimpleServer creates a new NewSimpleServer
 func NewSimpleServer(addr string) (*SimpleServer, error) {
-	host, config, err := serverConfig(addr)
+	user, pwd, host, config, err := serverConfig(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -34,20 +34,20 @@ func NewSimpleServer(addr string) (*SimpleServer, error) {
 		Server: Server{
 			ServerConfig: *config,
 		},
-		Network: "tcp",
-		Address: host,
+		Network:  "tcp",
+		Address:  host,
+		Username: user,
+		Password: pwd,
 	}
 	return s, nil
 }
 
-func serverConfig(addr string) (host string, config *ssh.ServerConfig, err error) {
+func serverConfig(addr string) (host, user, pwd string, config *ssh.ServerConfig, err error) {
 	ur, err := url.Parse(addr)
 	if err != nil {
-		return "", nil, err
+		return "", "", "", nil, err
 	}
 
-	user := ""
-	pwd := ""
 	isPwd := false
 	if ur.User != nil {
 		user = ur.User.Username()
@@ -57,19 +57,24 @@ func serverConfig(addr string) (host string, config *ssh.ServerConfig, err error
 	config = &ssh.ServerConfig{}
 
 	if isPwd {
+		user := user
+		pwd := pwd
 		config.PasswordCallback = func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-			if conn.User() == user && pwd == string(password) {
+			if conn.User() == user && string(password) == pwd {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("denied")
 		}
+	} else {
+		user = ""
+		pwd = ""
 	}
 
 	hostkeyFiles := ur.Query()["hostkey_file"]
 	if len(hostkeyFiles) == 0 {
 		key, err := sshd.RandomHostkey()
 		if err != nil {
-			return "", nil, err
+			return "", "", "", nil, err
 		}
 		config.AddHostKey(key)
 	} else {
@@ -86,7 +91,7 @@ func serverConfig(addr string) (host string, config *ssh.ServerConfig, err error
 
 			key, err := sshd.GetHostkey(ident)
 			if err != nil {
-				return "", nil, err
+				return "", "", "", nil, err
 			}
 			config.AddHostKey(key)
 		}
@@ -105,7 +110,7 @@ func serverConfig(addr string) (host string, config *ssh.ServerConfig, err error
 
 		keys, err := sshd.GetAuthorizedFile(ident)
 		if err != nil {
-			return "", nil, err
+			return "", "", "", nil, err
 		}
 		config.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			k := string(key.Marshal())
@@ -126,7 +131,7 @@ func serverConfig(addr string) (host string, config *ssh.ServerConfig, err error
 		port = "22"
 	}
 	host = net.JoinHostPort(host, port)
-	return host, config, nil
+	return user, pwd, host, config, nil
 }
 
 // Run the server
@@ -167,6 +172,9 @@ func (s *SimpleServer) ProxyURL() string {
 	u := url.URL{
 		Scheme: "ssh",
 		Host:   s.Address,
+	}
+	if s.Username != "" {
+		u.User = url.UserPassword(s.Username, s.Password)
 	}
 	return u.String()
 }
