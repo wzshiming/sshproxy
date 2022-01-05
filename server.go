@@ -1,9 +1,12 @@
 package sshproxy
 
 import (
-	"github.com/wzshiming/sshd"
 	_ "github.com/wzshiming/sshd/directtcp"
 	_ "github.com/wzshiming/sshd/tcpforward"
+
+	"github.com/wzshiming/sshd"
 )
 
 type Server = sshd.Server
+
+var NewServer = sshd.NewServer
