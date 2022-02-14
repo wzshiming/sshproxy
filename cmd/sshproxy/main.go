@@ -6,7 +6,10 @@ import (
 	"log"
 	"os"
 
-	_ "github.com/wzshiming/sshproxy"
+	_ "github.com/wzshiming/sshd/directstreamlocal"
+	_ "github.com/wzshiming/sshd/directtcp"
+	_ "github.com/wzshiming/sshd/streamlocalforward"
+	_ "github.com/wzshiming/sshd/tcpforward"
 
 	"github.com/wzshiming/sshd"
 	"golang.org/x/crypto/ssh"

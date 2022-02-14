@@ -1,9 +1,6 @@
 package sshproxy
 
 import (
-	_ "github.com/wzshiming/sshd/directtcp"
-	_ "github.com/wzshiming/sshd/tcpforward"
-
 	"github.com/wzshiming/sshd"
 )
 

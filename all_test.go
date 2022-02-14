@@ -6,6 +6,11 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	_ "github.com/wzshiming/sshd/directstreamlocal"
+	_ "github.com/wzshiming/sshd/directtcp"
+	_ "github.com/wzshiming/sshd/streamlocalforward"
+	_ "github.com/wzshiming/sshd/tcpforward"
 )
 
 var testServer = httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
