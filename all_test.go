@@ -27,6 +27,7 @@ func TestBind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer dial.Close()
 
 	listener, err := dial.Listen(context.Background(), "tcp", ":10000")
 	if err != nil {
@@ -51,6 +52,8 @@ func TestServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer dial.Close()
+
 	cli := testServer.Client()
 	cli.Transport = &http.Transport{
 		DialContext: dial.DialContext,
