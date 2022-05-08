@@ -19,8 +19,14 @@ var testServer = httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter
 
 func TestBind(t *testing.T) {
 	s, err := NewSimpleServer("ssh://u:p@:0")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	s.Start(context.Background())
+	err = s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer s.Close()
 
 	dial, err := NewDialer(s.ProxyURL())
@@ -44,8 +50,14 @@ func TestBind(t *testing.T) {
 
 func TestServer(t *testing.T) {
 	s, err := NewSimpleServer("ssh://u:p@:0")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	s.Start(context.Background())
+	err = s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer s.Close()
 
 	dial, err := NewDialer(s.ProxyURL())
