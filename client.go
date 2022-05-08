@@ -97,13 +97,7 @@ type Dialer struct {
 	config    *ssh.ClientConfig
 }
 
-func (d *Dialer) SSHClient() *ssh.Client {
-	d.mut.Lock()
-	defer d.mut.Unlock()
-	return d.sshCli
-}
-
-func (d *Dialer) reset() error {
+func (d *Dialer) Close() error {
 	d.mut.Lock()
 	defer d.mut.Unlock()
 	if d.sshCli == nil {
@@ -112,10 +106,6 @@ func (d *Dialer) reset() error {
 	err := d.sshCli.Close()
 	d.sshCli = nil
 	return err
-}
-
-func (d *Dialer) Close() error {
-	return d.reset()
 }
 
 func (d *Dialer) proxyDial(ctx context.Context, network, address string) (net.Conn, error) {
@@ -127,7 +117,7 @@ func (d *Dialer) proxyDial(ctx context.Context, network, address string) (net.Co
 	return proxyDial(ctx, network, address)
 }
 
-func (d *Dialer) getCli(ctx context.Context) (*ssh.Client, error) {
+func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 	d.mut.Lock()
 	defer d.mut.Unlock()
 	cli := d.sshCli
@@ -158,7 +148,7 @@ func (d *Dialer) CommandDialContext(ctx context.Context, name string, args ...st
 }
 
 func (d *Dialer) commandDialContext(ctx context.Context, cmd string, retry int) (net.Conn, error) {
-	cli, err := d.getCli(ctx)
+	cli, err := d.SSHClient(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +163,7 @@ func (d *Dialer) commandDialContext(ctx context.Context, cmd string, retry int) 
 	err = sess.Start(cmd)
 	if err != nil {
 		if retry != 0 {
-			d.reset()
+			d.Close()
 			return d.commandDialContext(ctx, cmd, retry-1)
 		}
 		return nil, err
@@ -207,14 +197,14 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 }
 
 func (d *Dialer) dialContext(ctx context.Context, network, address string, retry int) (net.Conn, error) {
-	cli, err := d.getCli(ctx)
+	cli, err := d.SSHClient(ctx)
 	if err != nil {
 		return nil, err
 	}
 	conn, err := cli.Dial(network, address)
 	if err != nil {
 		if retry != 0 {
-			d.reset()
+			d.Close()
 			return d.dialContext(ctx, network, address, retry-1)
 		}
 		return nil, err
@@ -233,14 +223,14 @@ func (d *Dialer) Listen(ctx context.Context, network, address string) (net.Liste
 }
 
 func (d *Dialer) listen(ctx context.Context, network, address string, retry int) (net.Listener, error) {
-	cli, err := d.getCli(ctx)
+	cli, err := d.SSHClient(ctx)
 	if err != nil {
 		return nil, err
 	}
 	listener, err := cli.Listen(network, address)
 	if err != nil {
 		if retry != 0 {
-			d.reset()
+			d.Close()
 			return d.listen(ctx, network, address, retry-1)
 		}
 		return nil, err
