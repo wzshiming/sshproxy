@@ -21,6 +21,10 @@ func NewDialer(addr string) (*Dialer, error) {
 	if err != nil {
 		return nil, err
 	}
+	return NewDialerWithConfig(host, config)
+}
+
+func NewDialerWithConfig(host string, config *ssh.ClientConfig) (*Dialer, error) {
 	return &Dialer{
 		host:   host,
 		config: config,
@@ -91,6 +95,12 @@ type Dialer struct {
 	sshCli    *ssh.Client
 	host      string
 	config    *ssh.ClientConfig
+}
+
+func (d *Dialer) SSHClient() *ssh.Client {
+	d.mut.Lock()
+	defer d.mut.Unlock()
+	return d.sshCli
 }
 
 func (d *Dialer) reset() error {
