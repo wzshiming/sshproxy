@@ -93,14 +93,19 @@ type Dialer struct {
 	config    *ssh.ClientConfig
 }
 
-func (d *Dialer) reset() {
+func (d *Dialer) reset() error {
 	d.mut.Lock()
 	defer d.mut.Unlock()
 	if d.sshCli == nil {
-		return
+		return nil
 	}
-	d.sshCli.Close()
+	err := d.sshCli.Close()
 	d.sshCli = nil
+	return err
+}
+
+func (d *Dialer) Close() error {
+	return d.reset()
 }
 
 func (d *Dialer) proxyDial(ctx context.Context, network, address string) (net.Conn, error) {
