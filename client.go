@@ -2,11 +2,9 @@ package sshproxy
 
 import (
 	"context"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,23 +52,12 @@ func clientConfig(addr string) (host string, config *ssh.ClientConfig, err error
 		config.Auth = append(config.Auth, ssh.Password(pwd))
 	}
 
-	identityFiles := ur.Query()["identity_file"]
-	for _, ident := range identityFiles {
-		if ident == "" {
-			continue
-		}
-		if strings.HasPrefix(ident, "~") {
-			home, err := os.UserHomeDir()
-			if err == nil {
-				ident = filepath.Join(home, ident[1:])
-			}
-		}
-
-		file, err := ioutil.ReadFile(ident)
-		if err != nil {
-			return "", nil, err
-		}
-		signer, err := ssh.ParsePrivateKey(file)
+	identityDatas, err := getQuery(ur.Query()["identity_data"], ur.Query()["identity_file"])
+	if err != nil {
+		return "", nil, err
+	}
+	for _, data := range identityDatas {
+		signer, err := ssh.ParsePrivateKey(data)
 		if err != nil {
 			return "", nil, err
 		}

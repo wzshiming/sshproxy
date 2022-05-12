@@ -1,13 +1,11 @@
 package sshproxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
 	"net/url"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/wzshiming/sshd"
 	"golang.org/x/crypto/ssh"
@@ -70,51 +68,44 @@ func serverConfig(addr string) (host, user, pwd string, config *ssh.ServerConfig
 		pwd = ""
 	}
 
-	hostkeyFiles := ur.Query()["hostkey_file"]
-	if len(hostkeyFiles) == 0 {
+	hostkeyDatas, err := getQuery(ur.Query()["hostkey_data"], ur.Query()["hostkey_file"])
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	if len(hostkeyDatas) == 0 {
 		key, err := sshd.RandomHostkey()
 		if err != nil {
 			return "", "", "", nil, err
 		}
 		config.AddHostKey(key)
 	} else {
-		for _, ident := range hostkeyFiles {
-			if ident == "" {
-				continue
-			}
-			if strings.HasPrefix(ident, "~") {
-				home, err := os.UserHomeDir()
-				if err == nil {
-					ident = filepath.Join(home, ident[1:])
-				}
-			}
-
-			key, err := sshd.GetHostkey(ident)
+		for _, data := range hostkeyDatas {
+			key, err := sshd.ParseHostkey(data)
 			if err != nil {
 				return "", "", "", nil, err
 			}
 			config.AddHostKey(key)
 		}
 	}
-	identityFiles := ur.Query()["authorized_file"]
-	for _, ident := range identityFiles {
-		if ident == "" {
-			continue
-		}
-		if strings.HasPrefix(ident, "~") {
-			home, err := os.UserHomeDir()
-			if err == nil {
-				ident = filepath.Join(home, ident[1:])
-			}
-		}
 
-		keys, err := sshd.GetAuthorizedFile(ident)
+	authorizedDatas, err := getQuery(ur.Query()["authorized_data"], ur.Query()["authorized_file"])
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	allKeys := map[string]string{}
+	for _, data := range authorizedDatas {
+		keys, err := sshd.ParseAuthorized(bytes.NewBuffer(data))
 		if err != nil {
 			return "", "", "", nil, err
 		}
+		for k, v := range keys {
+			allKeys[k] = v
+		}
+	}
+	if len(allKeys) != 0 {
 		config.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			k := string(key.Marshal())
-			if _, ok := keys[k]; ok {
+			if _, ok := allKeys[k]; ok {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("denied")
