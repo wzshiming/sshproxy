@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 
 	"github.com/wzshiming/sshd"
 	"golang.org/x/crypto/ssh"
@@ -112,7 +113,9 @@ func serverConfig(addr string) (host, user, pwd string, config *ssh.ServerConfig
 		}
 	}
 
-	if config.PasswordCallback == nil && config.PublicKeyCallback == nil && config.KeyboardInteractiveCallback == nil {
+	// must have be authenticated or not, default is false
+	authenticate, _ := strconv.ParseBool(ur.Query().Get("authenticate"))
+	if !authenticate && config.PasswordCallback == nil && config.PublicKeyCallback == nil && config.KeyboardInteractiveCallback == nil {
 		config.NoClientAuth = true
 	}
 
