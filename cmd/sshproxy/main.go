@@ -49,7 +49,7 @@ func main() {
 		}
 		svc.ServerConfig.AddHostKey(key)
 	}
-	if username != "" {
+	if username != "" && password != "" {
 		svc.ServerConfig.PasswordCallback = func(conn ssh.ConnMetadata, pwd []byte) (*ssh.Permissions, error) {
 			if conn.User() == username && password == string(pwd) {
 				return nil, nil
@@ -64,8 +64,8 @@ func main() {
 			return
 		}
 		svc.ServerConfig.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			k := string(key.Marshal())
-			if _, ok := keys[k]; ok {
+			ok, _ := keys.Allow(key)
+			if ok {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("denied")

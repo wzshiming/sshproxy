@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"path"
 	"strconv"
+	"time"
 
 	"github.com/wzshiming/sshd"
+	"github.com/wzshiming/sshproxy/permissions"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -24,14 +27,15 @@ type SimpleServer struct {
 
 // NewSimpleServer creates a new NewSimpleServer
 func NewSimpleServer(addr string) (*SimpleServer, error) {
-	user, pwd, host, config, err := serverConfig(addr)
+	user, pwd, host, config, userPermissions, err := serverConfig(addr)
 	if err != nil {
 		return nil, err
 	}
 
 	s := &SimpleServer{
 		Server: Server{
-			ServerConfig: *config,
+			ServerConfig:    *config,
+			UserPermissions: userPermissions,
 		},
 		Network:  "tcp",
 		Address:  host,
@@ -41,10 +45,10 @@ func NewSimpleServer(addr string) (*SimpleServer, error) {
 	return s, nil
 }
 
-func serverConfig(addr string) (host, user, pwd string, config *ssh.ServerConfig, err error) {
+func serverConfig(addr string) (host, user, pwd string, config *ssh.ServerConfig, userPermissions func(user string) sshd.Permissions, err error) {
 	ur, err := url.Parse(addr)
 	if err != nil {
-		return "", "", "", nil, err
+		return "", "", "", nil, nil, err
 	}
 
 	isPwd := false
@@ -71,45 +75,104 @@ func serverConfig(addr string) (host, user, pwd string, config *ssh.ServerConfig
 
 	hostkeyDatas, err := getQuery(ur.Query()["hostkey_data"], ur.Query()["hostkey_file"])
 	if err != nil {
-		return "", "", "", nil, err
+		return "", "", "", nil, nil, err
 	}
 	if len(hostkeyDatas) == 0 {
 		key, err := sshd.RandomHostkey()
 		if err != nil {
-			return "", "", "", nil, err
+			return "", "", "", nil, nil, err
 		}
 		config.AddHostKey(key)
 	} else {
 		for _, data := range hostkeyDatas {
 			key, err := sshd.ParseHostkey(data)
 			if err != nil {
-				return "", "", "", nil, err
+				return "", "", "", nil, nil, err
 			}
 			config.AddHostKey(key)
 		}
 	}
 
+	pks := []func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error){}
 	authorizedDatas, err := getQuery(ur.Query()["authorized_data"], ur.Query()["authorized_file"])
 	if err != nil {
-		return "", "", "", nil, err
+		return "", "", "", nil, nil, err
 	}
-	allKeys := map[string]string{}
-	for _, data := range authorizedDatas {
-		keys, err := sshd.ParseAuthorized(bytes.NewBuffer(data))
+	if len(authorizedDatas) != 0 {
+		keys, err := sshd.ParseAuthorized(bytes.NewBuffer(bytes.Join(authorizedDatas, []byte{'\n'})))
 		if err != nil {
-			return "", "", "", nil, err
+			return "", "", "", nil, nil, err
 		}
-		for k, v := range keys {
-			allKeys[k] = v
+		if len(keys.Data) != 0 {
+			pks = append(pks, func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+				ok, _ := keys.Allow(key)
+				if ok {
+					return nil, nil
+				}
+				return nil, fmt.Errorf("denied")
+			})
 		}
 	}
-	if len(allKeys) != 0 {
-		config.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			k := string(key.Marshal())
-			if _, ok := allKeys[k]; ok {
+
+	homeDirs := ur.Query()["home_dir"]
+	if len(homeDirs) != 0 && homeDirs[0] != "" {
+		homeDir := homeDirs[0]
+		sshDirName := ".ssh"
+		sshDirNames := ur.Query()["ssh_dir_name"]
+		if len(sshDirNames) != 0 {
+			sshDirName = sshDirNames[0]
+		}
+		authorizedFileName := "authorized_keys"
+		authorizedFileNames := ur.Query()["authorized_file_name"]
+		if len(authorizedFileNames) != 0 {
+			authorizedFileName = authorizedFileNames[0]
+		}
+		pks = append(pks, func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			file := path.Join(homeDir, conn.User(), sshDirName, authorizedFileName)
+			keys, err := sshd.GetAuthorizedFile(file)
+			if err != nil {
+				return nil, fmt.Errorf("denied")
+			}
+			ok, _ := keys.Allow(key)
+			if ok {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("denied")
+		})
+
+		// Other sshd implementations do not have such fine-grained permissions control,
+		// and this is a fine-grained set of permissions control files defined by the project itself
+		permissionsFileName := ""
+		permissionsFileNames := ur.Query()["permissions_file_name"]
+		if len(permissionsFileNames) != 0 {
+			permissionsFileName = permissionsFileNames[0]
+		}
+		if permissionsFileName != "" {
+			permissionsFileUpdatePeriod := time.Duration(0)
+			permissionsFileUpdatePeriods := ur.Query()["permissions_file_update_period"]
+			if len(permissionsFileUpdatePeriods) != 0 {
+				permissionsFileUpdatePeriod, _ = time.ParseDuration(permissionsFileUpdatePeriods[0])
+			}
+			userPermissions = func(user string) sshd.Permissions {
+				file := path.Join(homeDir, user, sshDirName, permissionsFileName)
+				return permissions.NewPermissionsFromFile(file, permissionsFileUpdatePeriod)
+			}
+		}
+	}
+
+	if len(pks) != 0 {
+		if len(pks) == 1 {
+			config.PublicKeyCallback = pks[0]
+		} else {
+			config.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (p *ssh.Permissions, err error) {
+				for _, pk := range pks {
+					p, err = pk(conn, key)
+					if err == nil {
+						break
+					}
+				}
+				return
+			}
 		}
 	}
 
@@ -125,7 +188,7 @@ func serverConfig(addr string) (host, user, pwd string, config *ssh.ServerConfig
 		port = "22"
 	}
 	host = net.JoinHostPort(host, port)
-	return user, pwd, host, config, nil
+	return user, pwd, host, config, userPermissions, nil
 }
 
 // Run the server
