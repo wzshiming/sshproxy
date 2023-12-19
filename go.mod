@@ -4,7 +4,7 @@ go 1.17
 
 require (
 	github.com/wzshiming/sshd v0.2.2
-	golang.org/x/crypto v0.3.0
+	golang.org/x/crypto v0.17.0
 )
 
-require golang.org/x/sys v0.2.0 // indirect
+require golang.org/x/sys v0.15.0 // indirect
