@@ -188,8 +188,11 @@ func (d *Dialer) dialContext(ctx context.Context, network, address string, retry
 	if err != nil {
 		return nil, err
 	}
-	conn, err := cli.Dial(network, address)
+	conn, err := cli.DialContext(ctx, network, address)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, err
+		}
 		if retry != 0 {
 			d.Close()
 			return d.dialContext(ctx, network, address, retry-1)
