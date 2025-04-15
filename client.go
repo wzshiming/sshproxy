@@ -7,7 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -25,9 +25,8 @@ func NewDialer(addr string) (*Dialer, error) {
 
 func NewDialerWithConfig(host string, config *ssh.ClientConfig) (*Dialer, error) {
 	return &Dialer{
-		host:    host,
-		config:  config,
-		clients: make(chan *ssh.Client, 5),
+		host:   host,
+		config: config,
 	}, nil
 }
 
@@ -103,13 +102,19 @@ type Dialer struct {
 	host   string
 	config *ssh.ClientConfig
 
-	conns   int32
-	clients chan *ssh.Client
+	mut    sync.RWMutex
+	sshCli *ssh.Client
 }
 
 func (d *Dialer) Close() error {
-	// In practice, closing the connection doesn't actually release the ssh.Conn but causes a memory leak
-	return nil
+	d.mut.Lock()
+	defer d.mut.Unlock()
+	if d.sshCli == nil {
+		return nil
+	}
+	err := d.sshCli.Close()
+	d.sshCli = nil
+	return err
 }
 
 func (d *Dialer) proxyDial(ctx context.Context, network, address string) (net.Conn, error) {
@@ -122,38 +127,20 @@ func (d *Dialer) proxyDial(ctx context.Context, network, address string) (net.Co
 }
 
 func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
-	cli, err := d.getClient(ctx)
-	if err != nil {
-		return nil, err
+	d.mut.RLock()
+	sshCli := d.sshCli
+	d.mut.RUnlock()
+
+	if sshCli != nil {
+		return sshCli, nil
 	}
-	d.putClient(cli)
-	return cli, nil
-}
 
-func (d *Dialer) getClient(ctx context.Context) (*ssh.Client, error) {
-	if atomic.LoadInt32(&d.conns) >= int32(cap(d.clients)) {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case cli := <-d.clients:
-			return cli, nil
-		}
+	d.mut.Lock()
+	defer d.mut.Unlock()
+	if d.sshCli != nil {
+		return d.sshCli, nil
 	}
-	atomic.AddInt32(&d.conns, 1)
 
-	cli, err := d.sshClient(ctx)
-	if err != nil {
-		atomic.AddInt32(&d.conns, -1)
-		return nil, err
-	}
-	return cli, nil
-}
-
-func (d *Dialer) putClient(cli *ssh.Client) {
-	d.clients <- cli
-}
-
-func (d *Dialer) sshClient(ctx context.Context) (*ssh.Client, error) {
 	conn, err := d.proxyDial(ctx, "tcp", d.host)
 	if err != nil {
 		return nil, err
@@ -163,7 +150,9 @@ func (d *Dialer) sshClient(ctx context.Context) (*ssh.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ssh.NewClient(con, chans, reqs), nil
+
+	d.sshCli = ssh.NewClient(con, chans, reqs)
+	return d.sshCli, nil
 }
 
 func buildCmd(name string, args ...string) string {
@@ -176,14 +165,14 @@ func buildCmd(name string, args ...string) string {
 }
 
 func (d *Dialer) CommandDialContext(ctx context.Context, name string, args ...string) (net.Conn, error) {
-	cli, err := d.getClient(ctx)
+	cli, err := d.SSHClient(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer d.putClient(cli)
 
 	sess, err := cli.NewSession()
 	if err != nil {
+		d.Close()
 		return nil, err
 	}
 
@@ -222,14 +211,14 @@ func (d *Dialer) CommandDialContext(ctx context.Context, name string, args ...st
 }
 
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	cli, err := d.getClient(ctx)
+	cli, err := d.SSHClient(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer d.putClient(cli)
 
 	conn, err := cli.DialContext(ctx, network, address)
 	if err != nil {
+		d.Close()
 		return nil, err
 	}
 
@@ -237,14 +226,14 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 }
 
 func (d *Dialer) Dial(network, address string) (net.Conn, error) {
-	cli, err := d.getClient(context.Background())
+	cli, err := d.SSHClient(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	defer d.putClient(cli)
 
 	conn, err := cli.Dial(network, address)
 	if err != nil {
+		d.Close()
 		return nil, err
 	}
 
@@ -259,14 +248,14 @@ func (d *Dialer) Listen(ctx context.Context, network, address string) (net.Liste
 		}
 	}
 
-	cli, err := d.getClient(ctx)
+	cli, err := d.SSHClient(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer d.putClient(cli)
 
 	listener, err := cli.Listen(network, address)
 	if err != nil {
+		d.Close()
 		return nil, err
 	}
 
