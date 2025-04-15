@@ -1,9 +1,9 @@
 module github.com/wzshiming/sshproxy
 
-go 1.17
+go 1.23.0
 
 require (
-	github.com/wzshiming/sshd v0.2.4
+	github.com/wzshiming/sshd v0.2.5
 	golang.org/x/crypto v0.35.0
 )
 
