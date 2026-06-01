@@ -77,3 +77,45 @@ func TestServer(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+func TestDialerConnections(t *testing.T) {
+	s, err := NewSimpleServer("ssh://u:p@:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	dial, err := NewDialer(s.ProxyURL() + "?connections=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dial.Close()
+
+	cli1, err := dial.SSHClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cli2, err := dial.SSHClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cli1 == cli2 {
+		t.Fatal("expected different ssh clients when pool is filling")
+	}
+
+	cli3, err := dial.SSHClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cli3 != cli1 && cli3 != cli2 {
+		t.Fatal("expected ssh client to be reused from pool")
+	}
+}
