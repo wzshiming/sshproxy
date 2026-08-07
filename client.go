@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -58,12 +59,32 @@ func parseClientConfig(addr string) (*clientConfig, error) {
 	}
 
 	config := &ssh.ClientConfig{
-		User:            user,
+		User: user,
+		// Insecure by default, overridden below when hostkey_data or
+		// hostkey_file is provided.
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
 	if isPwd {
 		config.Auth = append(config.Auth, ssh.Password(pwd))
+	}
+
+	// hostkey_data and hostkey_file hold the server's public host keys
+	// in authorized_keys format used to verify the server.
+	hostkeyDatas, err := getQuery(ur.Query()["hostkey_data"], ur.Query()["hostkey_file"])
+	if err != nil {
+		return nil, err
+	}
+	if len(hostkeyDatas) != 0 {
+		var hostKeys []ssh.PublicKey
+		for _, data := range hostkeyDatas {
+			keys, err := parseAuthorizedKeys(data)
+			if err != nil {
+				return nil, err
+			}
+			hostKeys = append(hostKeys, keys...)
+		}
+		config.HostKeyCallback = fixedHostKeys(hostKeys)
 	}
 
 	identityDatas, err := getQuery(ur.Query()["identity_data"], ur.Query()["identity_file"])
@@ -109,6 +130,35 @@ func parseClientConfig(addr string) (*clientConfig, error) {
 		host:         net.JoinHostPort(host, port),
 		connections:  connections,
 	}, nil
+}
+
+func parseAuthorizedKeys(data []byte) ([]ssh.PublicKey, error) {
+	var keys []ssh.PublicKey
+	for len(bytes.TrimSpace(data)) > 0 {
+		key, _, _, rest, err := ssh.ParseAuthorizedKey(data)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+		data = rest
+	}
+	return keys, nil
+}
+
+func fixedHostKeys(keys []ssh.PublicKey) ssh.HostKeyCallback {
+	marshaled := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		marshaled = append(marshaled, key.Marshal())
+	}
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		got := key.Marshal()
+		for _, want := range marshaled {
+			if bytes.Equal(got, want) {
+				return nil
+			}
+		}
+		return fmt.Errorf("ssh: no matching host key for %q", hostname)
+	}
 }
 
 type Dialer struct {
