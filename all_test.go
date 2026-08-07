@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/pem"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -41,15 +42,28 @@ func TestBind(t *testing.T) {
 	}
 	defer dial.Close()
 
-	listener, err := dial.Listen(context.Background(), "tcp", ":10000")
+	listener, err := dial.Listen(context.Background(), "tcp", ":0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer listener.Close()
 	go http.Serve(listener, nil)
-	time.Sleep(time.Second / 10)
-	resp, err := http.Get("http://127.0.0.1:10000")
+
+	_, port, err := net.SplitHostPort(listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	var resp *http.Response
+	for i := 0; ; i++ {
+		resp, err = http.Get("http://127.0.0.1:" + port)
+		if err == nil {
+			break
+		}
+		if i >= 50 {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	resp.Body.Close()
 }
