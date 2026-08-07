@@ -112,7 +112,6 @@ func parseClientConfig(addr string) (*clientConfig, error) {
 }
 
 type Dialer struct {
-	localAddr net.Addr
 	// ProxyDial specifies the optional dial function for
 	// establishing the transport connection.
 	ProxyDial func(context.Context, string, string) (net.Conn, error)
@@ -277,7 +276,7 @@ func (d *Dialer) CommandDialContext(ctx context.Context, name string, args ...st
 		cancel()
 		return nil
 	})
-	conn2 = connWithAddr(conn2, d.localAddr, newNetAddr("ssh-cmd", cmd))
+	conn2 = connWithAddr(conn2, nil, newNetAddr("ssh-cmd", cmd))
 	return conn2, nil
 }
 
