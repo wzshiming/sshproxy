@@ -45,7 +45,7 @@ func NewSimpleServer(addr string) (*SimpleServer, error) {
 	return s, nil
 }
 
-func serverConfig(addr string) (host, user, pwd string, config *ssh.ServerConfig, userPermissions func(user string) sshd.Permissions, err error) {
+func serverConfig(addr string) (user, pwd, host string, config *ssh.ServerConfig, userPermissions func(user string) sshd.Permissions, err error) {
 	ur, err := url.Parse(addr)
 	if err != nil {
 		return "", "", "", nil, nil, err
