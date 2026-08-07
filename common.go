@@ -2,7 +2,6 @@ package sshproxy
 
 import (
 	"encoding/base64"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,7 +54,7 @@ func openFiles(files []string) ([][]byte, error) {
 				f = filepath.Join(home, f[1:])
 			}
 		}
-		data, err := ioutil.ReadFile(f)
+		data, err := os.ReadFile(f)
 		if err != nil {
 			return nil, err
 		}
