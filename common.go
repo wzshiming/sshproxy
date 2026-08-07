@@ -48,7 +48,8 @@ func openFiles(files []string) ([][]byte, error) {
 		if f == "" {
 			continue
 		}
-		if strings.HasPrefix(f, "~") {
+		// Only expand "~" and "~/...", not "~user/..." which refers to another user's home.
+		if f == "~" || strings.HasPrefix(f, "~/") {
 			home, err := os.UserHomeDir()
 			if err == nil {
 				f = filepath.Join(home, f[1:])
