@@ -232,6 +232,10 @@ func buildCmd(name string, args ...string) string {
 	return strings.Join(cmds, " ")
 }
 
+// CommandDialContext executes a command on the remote host and returns a
+// net.Conn wired to its stdin/stdout. Unlike typical dialers, ctx governs
+// the whole connection lifetime: canceling it kills the remote command and
+// closes the connection.
 func (d *Dialer) CommandDialContext(ctx context.Context, name string, args ...string) (net.Conn, error) {
 	cli, err := d.SSHClient(ctx)
 	if err != nil {
