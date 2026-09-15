@@ -267,6 +267,10 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 
 	sshCli := ssh.NewClient(con, chans, reqs)
 	d.sshCli = append(d.sshCli, sshCli)
+	go func() {
+		sshCli.Wait()
+		d.closeSSHClient(sshCli)
+	}()
 	if len(d.sshCli) == 1 {
 		d.next = 0
 	}
@@ -294,7 +298,6 @@ func (d *Dialer) CommandDialContext(ctx context.Context, name string, args ...st
 
 	sess, err := cli.NewSession()
 	if err != nil {
-		d.closeSSHClient(cli)
 		return nil, err
 	}
 
@@ -342,7 +345,6 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 
 	conn, err := cli.DialContext(ctx, network, address)
 	if err != nil {
-		d.closeSSHClient(cli)
 		return nil, err
 	}
 
@@ -357,7 +359,6 @@ func (d *Dialer) Dial(network, address string) (net.Conn, error) {
 
 	conn, err := cli.Dial(network, address)
 	if err != nil {
-		d.closeSSHClient(cli)
 		return nil, err
 	}
 
@@ -379,7 +380,6 @@ func (d *Dialer) Listen(ctx context.Context, network, address string) (net.Liste
 
 	listener, err := cli.Listen(network, address)
 	if err != nil {
-		d.closeSSHClient(cli)
 		return nil, err
 	}
 
