@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -317,6 +319,167 @@ func TestClosedClientIsReplaced(t *testing.T) {
 			t.Fatal("closed SSH client remained in the pool for 2 seconds")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+type pausableConn struct {
+	net.Conn
+	paused    *atomic.Bool
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (conn *pausableConn) Read(data []byte) (int, error) {
+	count, err := conn.Conn.Read(data)
+	for conn.paused.Load() {
+		select {
+		case <-conn.closed:
+			return 0, net.ErrClosed
+		case <-time.After(time.Millisecond):
+		}
+	}
+	return count, err
+}
+
+func (conn *pausableConn) Write(data []byte) (int, error) {
+	if conn.paused.Load() {
+		return len(data), nil
+	}
+	return conn.Conn.Write(data)
+}
+
+func (conn *pausableConn) Close() error {
+	conn.closeOnce.Do(func() { close(conn.closed) })
+	return conn.Conn.Close()
+}
+
+func TestKeepAliveClosesUnresponsiveTransport(t *testing.T) {
+	ctx := context.Background()
+	s, err := NewSimpleServer("ssh://u:p@:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	dial, err := NewDialer(s.ProxyURL() + "?keepalive=50ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dial.Close()
+	var paused, wrapped atomic.Bool
+	var proxyDialer net.Dialer
+	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := proxyDialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		if !wrapped.CompareAndSwap(false, true) {
+			return conn, nil
+		}
+		return &pausableConn{Conn: conn, paused: &paused, closed: make(chan struct{})}, nil
+	}
+	cli1, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused.Store(true)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		cli2, err := dial.SSHClient(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cli2 != nil && cli2 != cli1 {
+			listener := newEchoListener(t)
+			conn, err := cli2.DialContext(ctx, "tcp", listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			assertEcho(t, conn)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("unresponsive SSH client remained in the pool after 10 keepalive intervals")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestKeepAliveKeepsHealthyTransport(t *testing.T) {
+	ctx := context.Background()
+	s, err := NewSimpleServer("ssh://u:p@:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	dial, err := NewDialer(s.ProxyURL() + "?keepalive=100ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dial.Close()
+	cli1, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, _, err := cli1.SendRequest("keepalive@openssh.com", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected the test server to reject the keepalive request")
+	}
+	time.Sleep(550 * time.Millisecond)
+	cli2, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cli2 != cli1 {
+		t.Fatal("keepalive replaced a healthy SSH client")
+	}
+	listener := newEchoListener(t)
+	conn, err := cli2.DialContext(ctx, "tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	assertEcho(t, conn)
+}
+
+func TestParseKeepAlive(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		query   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "absent"},
+		{name: "zero", query: "?keepalive=0"},
+		{name: "seconds", query: "?keepalive=30s", want: 30 * time.Second},
+		{name: "milliseconds", query: "?keepalive=50ms", want: 50 * time.Millisecond},
+		{name: "invalid", query: "?keepalive=abc", wantErr: true},
+		{name: "negative", query: "?keepalive=-1s", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config, err := parseClientConfig("ssh://u:p@h:22" + test.query)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("expected an invalid keepalive error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.keepAlive != test.want {
+				t.Fatalf("keepalive = %v, want %v", config.keepAlive, test.want)
+			}
+		})
 	}
 }
 

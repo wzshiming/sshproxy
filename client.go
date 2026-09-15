@@ -15,6 +15,8 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+const defaultKeepAlive time.Duration = 0
+
 // NewDialer returns a new Dialer that dials through the provided
 // proxy server's network and address.
 func NewDialer(addr string) (*Dialer, error) {
@@ -27,6 +29,7 @@ func NewDialer(addr string) (*Dialer, error) {
 		return nil, err
 	}
 	d.Connections = config.connections
+	d.KeepAlive = config.keepAlive
 	return d, nil
 }
 
@@ -42,6 +45,7 @@ type clientConfig struct {
 	host         string
 	clientConfig *ssh.ClientConfig
 	connections  int
+	keepAlive    time.Duration
 }
 
 func parseClientConfig(addr string) (*clientConfig, error) {
@@ -110,6 +114,15 @@ func parseClientConfig(addr string) (*clientConfig, error) {
 
 	config.Timeout = timeout
 
+	keepAlive := defaultKeepAlive
+	keepAliveStr := ur.Query().Get("keepalive")
+	if keepAliveStr != "" {
+		keepAlive, err = time.ParseDuration(keepAliveStr)
+		if err != nil || keepAlive < 0 {
+			return nil, fmt.Errorf("invalid keepalive: %q", keepAliveStr)
+		}
+	}
+
 	connections := 1
 	connectionsStr := ur.Query().Get("connections")
 	if connectionsStr != "" {
@@ -129,6 +142,7 @@ func parseClientConfig(addr string) (*clientConfig, error) {
 		clientConfig: config,
 		host:         net.JoinHostPort(host, port),
 		connections:  connections,
+		keepAlive:    keepAlive,
 	}, nil
 }
 
@@ -168,6 +182,11 @@ type Dialer struct {
 	// Connections is the maximum number of SSH transport connections maintained.
 	// Values less than or equal to 0 are treated as 1.
 	Connections int
+	// KeepAlive is the interval between keepalive@openssh.com global requests on
+	// every pooled client. A client is closed if neither a success nor a failure
+	// reply arrives within one interval. Zero disables keepalives (the default),
+	// matching OpenSSH's ServerAliveInterval default.
+	KeepAlive time.Duration
 
 	host   string
 	config *ssh.ClientConfig
@@ -267,14 +286,48 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 
 	sshCli := ssh.NewClient(con, chans, reqs)
 	d.sshCli = append(d.sshCli, sshCli)
+	dead := make(chan struct{})
 	go func() {
 		sshCli.Wait()
+		close(dead)
 		d.closeSSHClient(sshCli)
 	}()
+	if interval := d.KeepAlive; interval > 0 {
+		go d.keepAlive(sshCli, interval, dead)
+	}
 	if len(d.sshCli) == 1 {
 		d.next = 0
 	}
 	return sshCli, nil
+}
+
+func (d *Dialer) keepAlive(cli *ssh.Client, interval time.Duration, dead <-chan struct{}) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-dead:
+			return
+		case <-ticker.C:
+		}
+		replied := make(chan error, 1)
+		go func() {
+			_, _, err := cli.SendRequest("keepalive@openssh.com", true, nil)
+			replied <- err
+		}()
+		select {
+		case err := <-replied:
+			if err != nil {
+				d.closeSSHClient(cli)
+				return
+			}
+		case <-time.After(interval):
+			d.closeSSHClient(cli)
+			return
+		case <-dead:
+			return
+		}
+	}
 }
 
 func buildCmd(name string, args ...string) string {
