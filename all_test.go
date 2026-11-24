@@ -339,7 +339,7 @@ func TestClosedClientIsReplaced(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	dial, err := NewDialer(s.ProxyURL())
+	dial, err := NewDialer(s.ProxyURL() + "?keepalive=0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +406,7 @@ func TestRedialAfterTransportDropped(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
-			dial := newTestDialer(t, "")
+			dial := newTestDialer(t, "?keepalive=0")
 			var dials dialLog
 			dial.ProxyDial = dials.dial
 			address := newEchoListener(t).Addr().String()
@@ -435,7 +435,7 @@ func TestRedialAfterTransportDropped(t *testing.T) {
 
 func TestClosedClientIsReplacedInPool(t *testing.T) {
 	ctx := context.Background()
-	dial := newTestDialer(t, "?connections=2")
+	dial := newTestDialer(t, "?connections=2&keepalive=0")
 	var dials dialLog
 	dial.ProxyDial = dials.dial
 	cli1, err := dial.SSHClient(ctx)
@@ -489,7 +489,7 @@ func (conn *brokenWriteConn) Write(data []byte) (int, error) {
 
 func TestWriteFailureReplacesAndClosesClient(t *testing.T) {
 	ctx := context.Background()
-	dial := newTestDialer(t, "")
+	dial := newTestDialer(t, "?keepalive=0")
 	var broken, wrapped atomic.Bool
 	var proxyDialer net.Dialer
 	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -562,7 +562,7 @@ func TestReplacedClientsLeaveNoGoroutines(t *testing.T) {
 }
 
 func TestDialerCloseIgnoresEndedClient(t *testing.T) {
-	dial := newTestDialer(t, "")
+	dial := newTestDialer(t, "?keepalive=0")
 	cli, err := dial.SSHClient(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1028,7 +1028,7 @@ func TestParseKeepAlive(t *testing.T) {
 		want    time.Duration
 		wantErr bool
 	}{
-		{name: "absent"},
+		{name: "absent", want: 30 * time.Second},
 		{name: "zero", query: "?keepalive=0"},
 		{name: "seconds", query: "?keepalive=30s", want: 30 * time.Second},
 		{name: "milliseconds", query: "?keepalive=50ms", want: 50 * time.Millisecond},
@@ -1050,6 +1050,34 @@ func TestParseKeepAlive(t *testing.T) {
 				t.Fatalf("keepalive = %v, want %v", config.keepAlive, test.want)
 			}
 		})
+	}
+}
+
+func TestKeepAliveDefaultsOn(t *testing.T) {
+	const want = 30 * time.Second
+
+	dial, err := NewDialerWithConfig("127.0.0.1:22", &ssh.ClientConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dial.KeepAlive != want {
+		t.Fatalf("NewDialerWithConfig KeepAlive = %v, want %v", dial.KeepAlive, want)
+	}
+
+	dial, err = NewDialer("ssh://u:p@127.0.0.1:22")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dial.KeepAlive != want {
+		t.Fatalf("NewDialer KeepAlive = %v, want %v", dial.KeepAlive, want)
+	}
+
+	dial, err = NewDialer("ssh://u:p@127.0.0.1:22?keepalive=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dial.KeepAlive != 0 {
+		t.Fatalf("NewDialer with keepalive=0 KeepAlive = %v, want 0", dial.KeepAlive)
 	}
 }
 

@@ -16,7 +16,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const defaultKeepAlive time.Duration = 0
+const defaultKeepAlive time.Duration = 30 * time.Second
 
 // NewDialer returns a new Dialer that dials through the provided
 // proxy server's network and address.
@@ -39,6 +39,7 @@ func NewDialerWithConfig(host string, config *ssh.ClientConfig) (*Dialer, error)
 		host:        host,
 		config:      config,
 		Connections: 1,
+		KeepAlive:   defaultKeepAlive,
 	}, nil
 }
 
@@ -186,7 +187,7 @@ type Dialer struct {
 	// KeepAlive is the interval between keepalive@openssh.com global requests on
 	// every pooled client. A client is closed if a request errors, or if a whole
 	// interval passes with neither its reply nor any byte arriving. Zero disables
-	// keepalives (the default), matching OpenSSH's ServerAliveInterval default.
+	// keepalives; the default is 30s.
 	KeepAlive time.Duration
 
 	host   string
