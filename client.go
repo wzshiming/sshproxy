@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -192,22 +193,25 @@ type Dialer struct {
 	config *ssh.ClientConfig
 
 	mut    sync.Mutex
-	sshCli []*ssh.Client
+	sshCli []pooledClient
 	next   int
+}
+
+type pooledClient struct {
+	*ssh.Client
+	record *connRecord
 }
 
 func (d *Dialer) Close() error {
 	d.mut.Lock()
 	defer d.mut.Unlock()
+	d.purgeEnded()
 	if len(d.sshCli) == 0 {
 		return nil
 	}
 
 	var firstErr error
 	for _, sshCli := range d.sshCli {
-		if sshCli == nil {
-			continue
-		}
 		err := sshCli.Close()
 		if firstErr == nil {
 			firstErr = err
@@ -235,7 +239,7 @@ func (d *Dialer) closeSSHClient(sshCli *ssh.Client) error {
 	defer d.mut.Unlock()
 
 	for i := range d.sshCli {
-		if d.sshCli[i] != sshCli {
+		if d.sshCli[i].Client != sshCli {
 			continue
 		}
 
@@ -252,6 +256,17 @@ func (d *Dialer) closeSSHClient(sshCli *ssh.Client) error {
 	return sshCli.Close()
 }
 
+// purgeEnded requires d.mut to be held.
+func (d *Dialer) purgeEnded() {
+	d.sshCli = slices.DeleteFunc(d.sshCli, func(sshCli pooledClient) bool {
+		ended := sshCli.record.ended()
+		if ended {
+			sshCli.Close()
+		}
+		return ended
+	})
+}
+
 func (d *Dialer) proxyDial(ctx context.Context, network, address string) (net.Conn, error) {
 	proxyDial := d.ProxyDial
 	if proxyDial == nil {
@@ -265,35 +280,32 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 	d.mut.Lock()
 	defer d.mut.Unlock()
 
+	d.purgeEnded()
+
 	connections := d.connections()
 
 	if len(d.sshCli) > 0 && len(d.sshCli) >= connections {
 		idx := d.next % len(d.sshCli)
 		d.next = (d.next + 1) % len(d.sshCli)
-		return d.sshCli[idx], nil
+		return d.sshCli[idx].Client, nil
 	}
 
 	conn, err := d.proxyDial(ctx, "tcp", d.host)
 	if err != nil {
 		return nil, err
 	}
+	record := newConnRecord(conn)
 
-	con, chans, reqs, err := ssh.NewClientConn(conn, d.host, d.config)
+	con, chans, reqs, err := ssh.NewClientConn(record, d.host, d.config)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 
 	sshCli := ssh.NewClient(con, chans, reqs)
-	d.sshCli = append(d.sshCli, sshCli)
-	dead := make(chan struct{})
-	go func() {
-		sshCli.Wait()
-		close(dead)
-		d.closeSSHClient(sshCli)
-	}()
+	d.sshCli = append(d.sshCli, pooledClient{Client: sshCli, record: record})
 	if interval := d.KeepAlive; interval > 0 {
-		go d.keepAlive(sshCli, interval, dead)
+		go d.keepAlive(sshCli, interval, record.done())
 	}
 	if len(d.sshCli) == 1 {
 		d.next = 0

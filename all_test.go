@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -188,6 +190,24 @@ func assertEcho(t *testing.T, conn net.Conn) {
 	}
 }
 
+func newTestDialer(t *testing.T, query string) *Dialer {
+	t.Helper()
+	s, err := NewSimpleServer("ssh://u:p@:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	dial, err := NewDialer(s.ProxyURL() + query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dial.Close() })
+	return dial
+}
+
 func TestDialRejectedKeepsClient(t *testing.T) {
 	ctx := context.Background()
 	s, err := NewSimpleServer("ssh://u:p@:0")
@@ -277,6 +297,38 @@ func TestDialCanceledContextKeepsClient(t *testing.T) {
 	}
 }
 
+func TestDialInvalidAddressKeepsClient(t *testing.T) {
+	ctx := context.Background()
+	dial := newTestDialer(t, "")
+	listener := newEchoListener(t)
+	conn, err := dial.DialContext(ctx, "tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	assertEcho(t, conn)
+	cli1, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid, err := dial.DialContext(ctx, "tcp", "no-port")
+	if invalid != nil {
+		invalid.Close()
+	}
+	var addrErr *net.AddrError
+	if !errors.As(err, &addrErr) {
+		t.Fatalf("dial error = %v, want *net.AddrError", err)
+	}
+	assertEcho(t, conn)
+	cli2, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cli2 != cli1 {
+		t.Fatal("dial to an unparsable address replaced the shared SSH client")
+	}
+}
+
 func TestClosedClientIsReplaced(t *testing.T) {
 	ctx := context.Background()
 	s, err := NewSimpleServer("ssh://u:p@:0")
@@ -299,26 +351,325 @@ func TestClosedClientIsReplaced(t *testing.T) {
 	if err := cli1.Close(); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		cli2, err := dial.SSHClient(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cli2 != nil && cli2 != cli1 {
-			listener := newEchoListener(t)
-			conn, err := cli2.DialContext(ctx, "tcp", listener.Addr().String())
+	cli2, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cli2 == cli1 {
+		t.Fatal("closed SSH client was handed out again")
+	}
+	listener := newEchoListener(t)
+	conn, err := cli2.DialContext(ctx, "tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	assertEcho(t, conn)
+}
+
+// dialLog is a ProxyDial hook that keeps the connection of every call, nil for a failed one.
+type dialLog struct {
+	mut   sync.Mutex
+	conns []net.Conn
+}
+
+func (l *dialLog) dial(ctx context.Context, network, address string) (net.Conn, error) {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, network, address)
+	l.mut.Lock()
+	defer l.mut.Unlock()
+	l.conns = append(l.conns, conn)
+	return conn, err
+}
+
+func (l *dialLog) dialed() []net.Conn {
+	l.mut.Lock()
+	defer l.mut.Unlock()
+	return slices.Clone(l.conns)
+}
+
+func TestRedialAfterTransportDropped(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		dial func(ctx context.Context, dial *Dialer, address string) (net.Conn, error)
+	}{
+		{name: "DialContext", dial: func(ctx context.Context, dial *Dialer, address string) (net.Conn, error) {
+			return dial.DialContext(ctx, "tcp", address)
+		}},
+		{name: "SSHClient", dial: func(ctx context.Context, dial *Dialer, address string) (net.Conn, error) {
+			cli, err := dial.SSHClient(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return cli.DialContext(ctx, "tcp", address)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dial := newTestDialer(t, "")
+			var dials dialLog
+			dial.ProxyDial = dials.dial
+			address := newEchoListener(t).Addr().String()
+			conn, err := test.dial(ctx, dial, address)
 			if err != nil {
 				t.Fatal(err)
 			}
+			assertEcho(t, conn)
+			conn.Close()
+			dials.dialed()[0].Close()
+			if conn, err := test.dial(ctx, dial, address); err == nil {
+				conn.Close()
+			}
+			conn, err = test.dial(ctx, dial, address)
+			if err != nil {
+				t.Fatalf("dial after the transport dropped and one dial failed: %v", err)
+			}
 			defer conn.Close()
 			assertEcho(t, conn)
-			return
+			if got := len(dials.dialed()); got != 2 {
+				t.Fatalf("ProxyDial calls = %d, want 2", got)
+			}
+		})
+	}
+}
+
+func TestClosedClientIsReplacedInPool(t *testing.T) {
+	ctx := context.Background()
+	dial := newTestDialer(t, "?connections=2")
+	var dials dialLog
+	dial.ProxyDial = dials.dial
+	cli1, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dial.SSHClient(ctx); err != nil {
+		t.Fatal(err)
+	}
+	address := newEchoListener(t).Addr().String()
+	if err := cli1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	taken := map[*ssh.Client]bool{}
+	for i := 1; i <= 4; i++ {
+		cli, err := dial.SSHClient(ctx)
+		if err != nil {
+			t.Fatal(err)
 		}
+		if cli == cli1 {
+			t.Fatalf("take %d handed out the closed SSH client", i)
+		}
+		conn, err := cli.DialContext(ctx, "tcp", address)
+		if err != nil {
+			t.Fatalf("take %d handed out an unusable SSH client: %v", i, err)
+		}
+		assertEcho(t, conn)
+		conn.Close()
+		taken[cli] = true
+	}
+	if len(taken) != 2 {
+		t.Fatalf("distinct SSH clients handed out = %d, want 2", len(taken))
+	}
+	if got := len(dials.dialed()); got != 3 {
+		t.Fatalf("ProxyDial calls = %d, want 3", got)
+	}
+}
+
+// brokenWriteConn fails its writes once broken is set, while its reads keep blocking.
+type brokenWriteConn struct {
+	net.Conn
+	broken *atomic.Bool
+}
+
+func (conn *brokenWriteConn) Write(data []byte) (int, error) {
+	if conn.broken.Load() {
+		return 0, io.ErrClosedPipe
+	}
+	return conn.Conn.Write(data)
+}
+
+func TestWriteFailureReplacesAndClosesClient(t *testing.T) {
+	ctx := context.Background()
+	dial := newTestDialer(t, "")
+	var broken, wrapped atomic.Bool
+	var proxyDialer net.Dialer
+	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := proxyDialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		if !wrapped.CompareAndSwap(false, true) {
+			return conn, nil
+		}
+		return &brokenWriteConn{Conn: conn, broken: &broken}, nil
+	}
+	cli1, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken.Store(true)
+	dialCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	conn, err := dial.DialContext(dialCtx, "tcp", newEchoListener(t).Addr().String())
+	if err == nil {
+		conn.Close()
+		t.Fatal("dial over a transport whose writes fail succeeded")
+	}
+	cli2, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cli2 == cli1 {
+		t.Fatal("SSH client whose transport failed a write was handed out again")
+	}
+	closed := make(chan struct{})
+	go func() {
+		cli1.Wait()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("replaced SSH client was not closed within 1 second")
+	}
+}
+
+func TestReplacedClientsLeaveNoGoroutines(t *testing.T) {
+	ctx := context.Background()
+	dial := newTestDialer(t, "?keepalive=1h")
+	before := runtime.NumGoroutine()
+	for i := 0; i < 50; i++ {
+		cli, err := dial.SSHClient(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cli.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dial.SSHClient(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := dial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before+5 {
 		if time.Now().After(deadline) {
-			t.Fatal("closed SSH client remained in the pool for 2 seconds")
+			t.Fatalf("goroutines = %d after closing the dialer, want at most %d", runtime.NumGoroutine(), before+5)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestDialerCloseIgnoresEndedClient(t *testing.T) {
+	dial := newTestDialer(t, "")
+	cli, err := dial.SSHClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dial.Close(); err != nil {
+		t.Fatalf("closing a dialer whose only client was already closed: %v", err)
+	}
+}
+
+func TestConnRecordCountsArrivedBytes(t *testing.T) {
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+	record := newConnRecord(local)
+	if got := record.arrived(); got != 0 {
+		t.Fatalf("bytes arrived before any read = %d, want 0", got)
+	}
+	go remote.Write([]byte("hello"))
+	for _, size := range []int{2, 3} {
+		if _, err := io.ReadFull(record, make([]byte, size)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := record.arrived(); got != 5 {
+		t.Fatalf("bytes arrived after reading 2 and 3 bytes = %d, want 5", got)
+	}
+}
+
+// closeHookConn calls onClose as its Close begins.
+type closeHookConn struct {
+	net.Conn
+	onClose func()
+}
+
+func (conn *closeHookConn) Close() error {
+	conn.onClose()
+	return conn.Conn.Close()
+}
+
+func TestConnRecordEndsOnlyAfterClosingItsConnection(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+	var record *connRecord
+	record = newConnRecord(&closeHookConn{Conn: local, onClose: func() {
+		if record.ended() {
+			t.Error("record read as ended while its connection was closing")
+		}
+		select {
+		case <-record.done():
+			t.Error("record notified its end while its connection was closing")
+		default:
+		}
+	}})
+	if err := record.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConnRecordEnds(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		end  func(t *testing.T, record *connRecord, remote net.Conn)
+	}{
+		{name: "read error", end: func(t *testing.T, record *connRecord, remote net.Conn) {
+			remote.Close()
+			if _, err := record.Read(make([]byte, 1)); err == nil {
+				t.Fatal("read from a closed pipe succeeded")
+			}
+		}},
+		{name: "write error", end: func(t *testing.T, record *connRecord, remote net.Conn) {
+			remote.Close()
+			if _, err := record.Write([]byte{0}); err == nil {
+				t.Fatal("write to a closed pipe succeeded")
+			}
+		}},
+		{name: "close", end: func(t *testing.T, record *connRecord, remote net.Conn) {
+			if err := record.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			local, remote := net.Pipe()
+			defer local.Close()
+			defer remote.Close()
+			record := newConnRecord(local)
+			if record.ended() {
+				t.Fatal("open connection reads as ended")
+			}
+			select {
+			case <-record.done():
+				t.Fatal("open connection notified its end")
+			default:
+			}
+			test.end(t, record, remote)
+			if !record.ended() {
+				t.Fatal("connection does not read as ended")
+			}
+			select {
+			case <-record.done():
+			default:
+				t.Fatal("connection did not notify its end")
+			}
+		})
 	}
 }
 
