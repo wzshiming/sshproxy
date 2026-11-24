@@ -53,6 +53,7 @@ type connRecord struct {
 	read    atomic.Int64
 	end     chan struct{}
 	endOnce sync.Once
+	onEnd   func() // optional, runs once as the connection ends
 }
 
 func (w *connRecord) Read(b []byte) (int, error) {
@@ -79,7 +80,12 @@ func (w *connRecord) Close() error {
 }
 
 func (w *connRecord) markEnded() {
-	w.endOnce.Do(func() { close(w.end) })
+	w.endOnce.Do(func() {
+		if w.onEnd != nil {
+			w.onEnd()
+		}
+		close(w.end)
+	})
 }
 
 func (w *connRecord) ended() bool {

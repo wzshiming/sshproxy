@@ -834,6 +834,504 @@ func TestParseKeepAlive(t *testing.T) {
 	}
 }
 
+func TestParseTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		query   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "absent", want: 30 * time.Second},
+		{name: "zero", query: "?timeout=0"},
+		{name: "milliseconds", query: "?timeout=200ms", want: 200 * time.Millisecond},
+		{name: "invalid", query: "?timeout=abc", wantErr: true},
+		{name: "negative", query: "?timeout=-1s", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config, err := parseClientConfig("ssh://u:p@h:22" + test.query)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("expected an invalid timeout error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.clientConfig.Timeout != test.want {
+				t.Fatalf("timeout = %v, want %v", config.clientConfig.Timeout, test.want)
+			}
+		})
+	}
+}
+
+// newSilentListener accepts TCP connections and never writes to them; closed is signaled when a client closes one.
+func newSilentListener(t *testing.T) (net.Listener, <-chan struct{}) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	closed := make(chan struct{}, 1)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				stop := context.AfterFunc(t.Context(), func() { conn.Close() })
+				io.Copy(io.Discard, conn)
+				if stop() {
+					conn.Close()
+					select {
+					case closed <- struct{}{}:
+					default:
+					}
+				}
+			}()
+		}
+	}()
+	return listener, closed
+}
+
+// sshClientWithin calls dial.SSHClient and fails the test unless it returns within limit.
+func sshClientWithin(t *testing.T, dial *Dialer, limit time.Duration) (*ssh.Client, time.Duration, error) {
+	t.Helper()
+	type result struct {
+		cli *ssh.Client
+		err error
+	}
+	returned := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		cli, err := dial.SSHClient(context.Background())
+		returned <- result{cli: cli, err: err}
+	}()
+	select {
+	case r := <-returned:
+		return r.cli, time.Since(start), r.err
+	case <-time.After(limit):
+		t.Fatalf("SSHClient did not return within %v", limit)
+		return nil, 0, nil
+	}
+}
+
+// assertSSHClientTimesOut fails unless SSHClient reports a timeout no sooner than atLeast and within limit.
+func assertSSHClientTimesOut(t *testing.T, dial *Dialer, atLeast, limit time.Duration) {
+	t.Helper()
+	_, elapsed, err := sshClientWithin(t, dial, limit)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SSHClient returned %v after %v, want a context.DeadlineExceeded error", err, elapsed)
+	}
+	if elapsed < atLeast {
+		t.Fatalf("SSHClient timed out after %v, before %v", elapsed, atLeast)
+	}
+}
+
+func TestTimeoutBoundsSilentServer(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		newDialer func(host string) (*Dialer, error)
+	}{
+		{name: "NewDialer", newDialer: func(host string) (*Dialer, error) {
+			return NewDialer("ssh://u:p@" + host + "?timeout=200ms")
+		}},
+		{name: "NewDialerWithConfig", newDialer: func(host string) (*Dialer, error) {
+			return NewDialerWithConfig(host, &ssh.ClientConfig{
+				User:            "u",
+				Auth:            []ssh.AuthMethod{ssh.Password("p")},
+				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+				Timeout:         200 * time.Millisecond,
+			})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listener, _ := newSilentListener(t)
+			dial, err := test.newDialer(listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { dial.Close() })
+			assertSSHClientTimesOut(t, dial, 200*time.Millisecond, 2*time.Second)
+		})
+	}
+}
+
+func TestTimeoutBoundsBlockedProxyDial(t *testing.T) {
+	dial, err := NewDialer("ssh://u:p@127.0.0.1:22?timeout=200ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	assertSSHClientTimesOut(t, dial, 200*time.Millisecond, 2*time.Second)
+}
+
+func TestTimeoutCoversDialAndHandshake(t *testing.T) {
+	listener, _ := newSilentListener(t)
+	dial, err := NewDialer("ssh://u:p@" + listener.Addr().String() + "?timeout=400ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dial.Close() })
+	var proxyDialer net.Dialer
+	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		time.Sleep(300 * time.Millisecond)
+		return proxyDialer.DialContext(ctx, network, address)
+	}
+	assertSSHClientTimesOut(t, dial, 400*time.Millisecond, 600*time.Millisecond)
+}
+
+func TestTimeoutClosesConnectionAndFreesPool(t *testing.T) {
+	silent, closed := newSilentListener(t)
+	dial := newTestDialer(t, "?timeout=200ms")
+	var dials atomic.Int32
+	var proxyDialer net.Dialer
+	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if dials.Add(1) == 1 {
+			address = silent.Addr().String()
+		}
+		return proxyDialer.DialContext(ctx, network, address)
+	}
+	assertSSHClientTimesOut(t, dial, 200*time.Millisecond, 2*time.Second)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("silent server did not see the connection closed within 1 second")
+	}
+	cli, _, err := sshClientWithin(t, dial, 2*time.Second)
+	if err != nil {
+		t.Fatalf("SSHClient after a timed-out attempt: %v", err)
+	}
+	conn, err := cli.DialContext(context.Background(), "tcp", newEchoListener(t).Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	assertEcho(t, conn)
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("ProxyDial calls = %d, want 2", got)
+	}
+}
+
+func TestTimeoutClosesConnectionDialedTooLate(t *testing.T) {
+	dial, err := NewDialer("ssh://u:p@127.0.0.1:22?timeout=100ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		time.Sleep(200 * time.Millisecond)
+		conn, _ := net.Pipe()
+		return &closeHookConn{Conn: conn, onClose: func() { closed = true }}, nil
+	}
+	assertSSHClientTimesOut(t, dial, 200*time.Millisecond, 2*time.Second)
+	if !closed {
+		t.Fatal("connection that ProxyDial returned after the deadline was left open")
+	}
+}
+
+func TestTimeoutLeavesNoLimitOnClient(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		wrap func(ctx context.Context, conn net.Conn) net.Conn
+	}{
+		{name: "plain connection", wrap: func(ctx context.Context, conn net.Conn) net.Conn {
+			return conn
+		}},
+		{name: "connection that ends with its dial context", wrap: func(ctx context.Context, conn net.Conn) net.Conn {
+			context.AfterFunc(ctx, func() { conn.Close() })
+			return conn
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dial := newTestDialer(t, "?timeout=100ms")
+			var dials atomic.Int32
+			var proxyDialer net.Dialer
+			dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+				dials.Add(1)
+				conn, err := proxyDialer.DialContext(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				return test.wrap(ctx, conn), nil
+			}
+			if _, err := dial.SSHClient(ctx); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(300 * time.Millisecond)
+			conn, err := dial.DialContext(ctx, "tcp", newEchoListener(t).Addr().String())
+			if err != nil {
+				t.Fatalf("dial after the client idled past the timeout: %v", err)
+			}
+			defer conn.Close()
+			assertEcho(t, conn)
+			if got := dials.Load(); got != 1 {
+				t.Fatalf("ProxyDial calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// slowFirstReadConn holds its first read back by delay.
+type slowFirstReadConn struct {
+	net.Conn
+	delay time.Duration
+	once  sync.Once
+}
+
+func (conn *slowFirstReadConn) Read(data []byte) (int, error) {
+	conn.once.Do(func() { time.Sleep(conn.delay) })
+	return conn.Conn.Read(data)
+}
+
+func dialSlowFirstRead(delay time.Duration) func(context.Context, string, string) (net.Conn, error) {
+	var proxyDialer net.Dialer
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := proxyDialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &slowFirstReadConn{Conn: conn, delay: delay}, nil
+	}
+}
+
+func TestZeroTimeoutImposesNoLimit(t *testing.T) {
+	for _, test := range []struct {
+		timeout string
+		wantErr bool
+	}{
+		{timeout: "0"},
+		{timeout: "100ms", wantErr: true},
+	} {
+		t.Run(test.timeout, func(t *testing.T) {
+			dial := newTestDialer(t, "?timeout="+test.timeout)
+			dial.ProxyDial = dialSlowFirstRead(300 * time.Millisecond)
+			_, _, err := sshClientWithin(t, dial, 2*time.Second)
+			if test.wantErr && err == nil {
+				t.Fatal("SSHClient succeeded over a connection whose first read waits 300ms")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("SSHClient over a connection whose first read waits 300ms: %v", err)
+			}
+		})
+	}
+}
+
+func TestHandshakeOutlivesCanceledContext(t *testing.T) {
+	dial := newTestDialer(t, "?timeout=2s")
+	dial.ProxyDial = dialSlowFirstRead(300 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	time.AfterFunc(100*time.Millisecond, cancel)
+	cli, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatalf("SSHClient whose context ended during the handshake: %v", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("handshake finished before the context ended")
+	}
+	conn, err := cli.DialContext(context.Background(), "tcp", newEchoListener(t).Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	assertEcho(t, conn)
+}
+
+// refuseDial is a ProxyDial hook that fails at once.
+func refuseDial(ctx context.Context, network, address string) (net.Conn, error) {
+	return nil, errors.New("refused")
+}
+
+func TestFailedSetupReleasesDialContext(t *testing.T) {
+	_, strangerKey := genHostKey(t)
+	var proxyDialer net.Dialer
+	for _, test := range []struct {
+		name  string
+		query string
+		dial  func(ctx context.Context, network, address string) (net.Conn, error)
+	}{
+		{name: "ProxyDial error", dial: refuseDial},
+		{name: "ProxyDial error without a timeout", query: "?timeout=0", dial: refuseDial},
+		{name: "handshake error", query: "?hostkey_data=" + strangerKey, dial: proxyDialer.DialContext},
+		{name: "deadline during handshake", query: "?timeout=100ms", dial: dialSlowFirstRead(300 * time.Millisecond)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dial := newTestDialer(t, test.query)
+			var dialCtx context.Context
+			dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+				dialCtx = ctx
+				return test.dial(ctx, network, address)
+			}
+			_, _, err := sshClientWithin(t, dial, 2*time.Second)
+			if err == nil {
+				t.Fatal("SSHClient succeeded")
+			}
+			if dialCtx.Err() == nil {
+				t.Fatalf("dial context is still live after SSHClient failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestDialContextEndsWithConnection(t *testing.T) {
+	type pooled struct {
+		dial      *Dialer
+		cli       *ssh.Client
+		transport net.Conn
+		broken    atomic.Bool
+	}
+	for _, test := range []struct {
+		name string
+		end  func(p *pooled)
+	}{
+		{name: "client closed", end: func(p *pooled) { p.cli.Close() }},
+		{name: "dialer closed", end: func(p *pooled) { p.dial.Close() }},
+		{name: "read failed", end: func(p *pooled) {
+			p.transport.Close()
+			p.cli.Wait()
+		}},
+		{name: "write failed", end: func(p *pooled) {
+			p.broken.Store(true)
+			p.cli.SendRequest("keepalive@openssh.com", false, nil)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := &pooled{dial: newTestDialer(t, "?keepalive=0")}
+			var dialCtx context.Context
+			var proxyDialer net.Dialer
+			p.dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+				conn, err := proxyDialer.DialContext(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				dialCtx, p.transport = ctx, conn
+				return &brokenWriteConn{Conn: conn, broken: &p.broken}, nil
+			}
+			var err error
+			if p.cli, err = p.dial.SSHClient(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := dialCtx.Err(); err != nil {
+				t.Fatalf("dial context ended while its connection is live: %v", err)
+			}
+			test.end(p)
+			if dialCtx.Err() == nil {
+				t.Fatal("dial context is still live after its connection ended")
+			}
+		})
+	}
+}
+
+// foreignCtx is of a type the context package does not know: each live child of it holds a goroutine.
+type foreignCtx struct {
+	context.Context
+	done chan struct{}
+}
+
+func (ctx foreignCtx) Done() <-chan struct{} {
+	return ctx.done
+}
+
+func TestDialContextsLeaveNoGoroutines(t *testing.T) {
+	_, strangerKey := genHostKey(t)
+	for _, test := range []struct {
+		name    string
+		query   string
+		dial    func(ctx context.Context, network, address string) (net.Conn, error)
+		rounds  int
+		wantErr bool
+	}{
+		{name: "failed ProxyDials", dial: refuseDial, rounds: 1000, wantErr: true},
+		{name: "failed handshakes", query: "?hostkey_data=" + strangerKey, rounds: 50, wantErr: true},
+		{name: "clients taken and closed", rounds: 50},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := foreignCtx{Context: context.Background(), done: make(chan struct{})}
+			dial := newTestDialer(t, test.query)
+			dial.ProxyDial = test.dial
+			before := runtime.NumGoroutine()
+			for i := 0; i < test.rounds; i++ {
+				cli, err := dial.SSHClient(ctx)
+				if (err != nil) != test.wantErr {
+					t.Fatalf("SSHClient error = %v, want an error: %v", err, test.wantErr)
+				}
+				if err != nil {
+					continue
+				}
+				if err := cli.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := dial.Close(); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for runtime.NumGoroutine() > before+5 {
+				if time.Now().After(deadline) {
+					t.Fatalf("goroutines = %d after %d setups and closing the dialer, want at most %d", runtime.NumGoroutine(), test.rounds, before+5)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+}
+
+func TestTimeoutThroughHopWithoutDeadlines(t *testing.T) {
+	hop := newTestDialer(t, "")
+	probe, err := hop.DialContext(context.Background(), "tcp", newEchoListener(t).Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = probe.SetReadDeadline(time.Time{})
+	probe.Close()
+	if err == nil {
+		t.Fatal("connection through the SSH hop supports deadlines")
+	}
+	t.Run("healthy server", func(t *testing.T) {
+		s, err := NewSimpleServer("ssh://u:p@127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { s.Close() })
+		dial, err := NewDialer(s.ProxyURL() + "?timeout=1s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { dial.Close() })
+		dial.ProxyDial = hop.DialContext
+		cli, err := dial.SSHClient(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := cli.DialContext(context.Background(), "tcp", newEchoListener(t).Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		assertEcho(t, conn)
+	})
+	t.Run("silent server", func(t *testing.T) {
+		listener, _ := newSilentListener(t)
+		dial, err := NewDialer("ssh://u:p@" + listener.Addr().String() + "?timeout=200ms")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { dial.Close() })
+		dial.ProxyDial = hop.DialContext
+		assertSSHClientTimesOut(t, dial, 200*time.Millisecond, 2*time.Second)
+	})
+}
+
 func genHostKey(t *testing.T) (privData, pubData string) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)

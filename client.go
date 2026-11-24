@@ -108,8 +108,8 @@ func parseClientConfig(addr string) (*clientConfig, error) {
 	timeoutStr := ur.Query().Get("timeout")
 	if timeoutStr != "" {
 		timeout, err = time.ParseDuration(timeoutStr)
-		if err != nil {
-			return nil, err
+		if err != nil || timeout < 0 {
+			return nil, fmt.Errorf("invalid timeout: %q", timeoutStr)
 		}
 	}
 
@@ -290,13 +290,36 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 		return d.sshCli[idx].Client, nil
 	}
 
-	conn, err := d.proxyDial(ctx, "tcp", d.host)
+	var deadline time.Time
+	if timeout := d.config.Timeout; timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	// Live until its conn ends: a ProxyDial conn may live only as long as its ctx.
+	dialCtx, cancelDial := context.WithCancel(ctx)
+
+	stopLimit := atDeadline(deadline, cancelDial)
+	conn, err := d.proxyDial(dialCtx, "tcp", d.host)
+	if !stopLimit() {
+		if err == nil {
+			conn.Close()
+		}
+		err = d.timeoutError()
+	}
 	if err != nil {
+		cancelDial()
 		return nil, err
 	}
 	record := newConnRecord(conn)
+	record.onEnd = cancelDial
 
+	stopLimit = atDeadline(deadline, func() { conn.Close() })
 	con, chans, reqs, err := ssh.NewClientConn(record, d.host, d.config)
+	if !stopLimit() {
+		if err == nil {
+			con.Close()
+		}
+		return nil, d.timeoutError()
+	}
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -311,6 +334,18 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 		d.next = 0
 	}
 	return sshCli, nil
+}
+
+// atDeadline runs f at a non-zero deadline; stop prevents that and reports whether it did.
+func atDeadline(deadline time.Time, f func()) (stop func() bool) {
+	if deadline.IsZero() {
+		return func() bool { return true }
+	}
+	return time.AfterFunc(time.Until(deadline), f).Stop
+}
+
+func (d *Dialer) timeoutError() error {
+	return fmt.Errorf("ssh: connecting to %s exceeded the %v timeout: %w", d.host, d.config.Timeout, context.DeadlineExceeded)
 }
 
 func (d *Dialer) keepAlive(cli *ssh.Client, interval time.Duration, dead <-chan struct{}) {
