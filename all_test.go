@@ -802,6 +802,225 @@ func TestKeepAliveKeepsHealthyTransport(t *testing.T) {
 	assertEcho(t, conn)
 }
 
+// throttledConn slows its reads to at most 1 KiB per 20ms while throttled is set.
+type throttledConn struct {
+	net.Conn
+	throttled *atomic.Bool
+}
+
+func (conn *throttledConn) Read(data []byte) (int, error) {
+	if conn.throttled.Load() {
+		time.Sleep(20 * time.Millisecond)
+		data = data[:min(len(data), 1<<10)]
+	}
+	return conn.Conn.Read(data)
+}
+
+// newFirehoseListener accepts TCP connections and writes to each until a write fails.
+func newFirehoseListener(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				data := make([]byte, 32<<10)
+				for {
+					if _, err := conn.Write(data); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return listener
+}
+
+// download keeps reading a firehose through cli and returns the count of bytes received.
+func download(t *testing.T, cli *ssh.Client) *atomic.Int64 {
+	t.Helper()
+	conn, err := cli.DialContext(context.Background(), "tcp", newFirehoseListener(t).Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	var received atomic.Int64
+	go func() {
+		data := make([]byte, 32<<10)
+		for {
+			n, err := conn.Read(data)
+			received.Add(int64(n))
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return &received
+}
+
+func TestKeepAliveKeepsBusySlowTransport(t *testing.T) {
+	ctx := context.Background()
+	interval := 100 * time.Millisecond
+	dial := newTestDialer(t, "?keepalive=100ms")
+	var throttled atomic.Bool
+	var dials atomic.Int32
+	var proxyDialer net.Dialer
+	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		conn, err := proxyDialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &throttledConn{Conn: conn, throttled: &throttled}, nil
+	}
+	cli1, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := download(t, cli1)
+	// The keepalive reply queues behind the download on the throttled transport.
+	throttled.Store(true)
+	start := time.Now()
+	time.Sleep(2 * interval)
+	goroutines := runtime.NumGoroutine()
+	time.Sleep(time.Until(start.Add(5 * interval)))
+	cli2, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cli2 != cli1 {
+		t.Fatalf("keepalive replaced the SSH client of a busy slow transport within 5 intervals (ProxyDial calls = %d)", dials.Load())
+	}
+	arrived := received.Load()
+	time.Sleep(time.Until(start.Add(8 * interval)))
+	if got := runtime.NumGoroutine(); got > goroutines+2 {
+		t.Fatalf("goroutines = %d at the 8th keepalive interval, %d at the 2nd: unanswered keepalives pile up", got, goroutines)
+	}
+	// A 32 KiB channel packet takes about 0.65s to cross the throttled transport.
+	for received.Load() == arrived {
+		if time.Since(start) > 3*time.Second {
+			t.Fatal("the download stalled after 5 keepalive intervals, so no byte arrived while the keepalive reply queued")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	throttled.Store(false)
+	conn, err := dial.DialContext(ctx, "tcp", newEchoListener(t).Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	assertEcho(t, conn)
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("ProxyDial calls = %d, want 1", got)
+	}
+}
+
+func TestKeepAliveReplacesSilencedTransport(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		busy bool
+	}{
+		{name: "idle"},
+		{name: "busy", busy: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			interval := 100 * time.Millisecond
+			dial := newTestDialer(t, "?keepalive=100ms")
+			var throttled, paused, wrapped atomic.Bool
+			var proxyDialer net.Dialer
+			dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+				conn, err := proxyDialer.DialContext(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				if !wrapped.CompareAndSwap(false, true) {
+					return conn, nil
+				}
+				conn = &throttledConn{Conn: conn, throttled: &throttled}
+				return &pausableConn{Conn: conn, paused: &paused, closed: make(chan struct{})}, nil
+			}
+			cli1, err := dial.SSHClient(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.busy {
+				download(t, cli1)
+				throttled.Store(true)
+				time.Sleep(3 * interval)
+			}
+			paused.Store(true)
+			deadline := time.Now().Add(5 * interval)
+			for {
+				if time.Now().After(deadline) {
+					t.Fatal("SSH client whose transport went silent remained in the pool for 5 keepalive intervals")
+				}
+				cli2, err := dial.SSHClient(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if cli2 != cli1 {
+					conn, err := cli2.DialContext(ctx, "tcp", newEchoListener(t).Addr().String())
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer conn.Close()
+					assertEcho(t, conn)
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+}
+
+func TestKeepAliveClosesClientWhoseWriteFailed(t *testing.T) {
+	ctx := context.Background()
+	interval := time.Second
+	dial := newTestDialer(t, "?keepalive=1s")
+	var broken atomic.Bool
+	var proxyDialer net.Dialer
+	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := proxyDialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &brokenWriteConn{Conn: conn, broken: &broken}, nil
+	}
+	cli, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan struct{})
+	go func() {
+		cli.Wait()
+		close(closed)
+	}()
+	address := newEchoListener(t).Addr().String()
+	broken.Store(true)
+	limit := time.After(interval / 4)
+	// The lost open request leaves the dial waiting until the client closes.
+	dialCtx, cancel := context.WithTimeout(ctx, interval/10)
+	defer cancel()
+	if conn, err := dial.DialContext(dialCtx, "tcp", address); err == nil {
+		conn.Close()
+		t.Fatal("dial over a transport whose writes fail succeeded")
+	}
+	select {
+	case <-closed:
+	case <-limit:
+		t.Fatalf("SSH client whose transport failed a write was not closed within %v, a quarter of its keepalive interval", interval/4)
+	}
+}
+
 func TestParseKeepAlive(t *testing.T) {
 	for _, test := range []struct {
 		name    string

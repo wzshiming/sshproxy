@@ -184,9 +184,9 @@ type Dialer struct {
 	// Values less than or equal to 0 are treated as 1.
 	Connections int
 	// KeepAlive is the interval between keepalive@openssh.com global requests on
-	// every pooled client. A client is closed if neither a success nor a failure
-	// reply arrives within one interval. Zero disables keepalives (the default),
-	// matching OpenSSH's ServerAliveInterval default.
+	// every pooled client. A client is closed if a request errors, or if a whole
+	// interval passes with neither its reply nor any byte arriving. Zero disables
+	// keepalives (the default), matching OpenSSH's ServerAliveInterval default.
 	KeepAlive time.Duration
 
 	host   string
@@ -328,7 +328,7 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 	sshCli := ssh.NewClient(con, chans, reqs)
 	d.sshCli = append(d.sshCli, pooledClient{Client: sshCli, record: record})
 	if interval := d.KeepAlive; interval > 0 {
-		go d.keepAlive(sshCli, interval, record.done())
+		go d.keepAlive(sshCli, interval, record)
 	}
 	if len(d.sshCli) == 1 {
 		d.next = 0
@@ -348,31 +348,39 @@ func (d *Dialer) timeoutError() error {
 	return fmt.Errorf("ssh: connecting to %s exceeded the %v timeout: %w", d.host, d.config.Timeout, context.DeadlineExceeded)
 }
 
-func (d *Dialer) keepAlive(cli *ssh.Client, interval time.Duration, dead <-chan struct{}) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+func (d *Dialer) keepAlive(cli *ssh.Client, interval time.Duration, record *connRecord) {
+	defer d.closeSSHClient(cli)
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	var replied chan error // non-nil while a probe awaits its reply
+	var arrived int64
 	for {
 		select {
-		case <-dead:
+		case <-record.done():
 			return
-		case <-ticker.C:
-		}
-		replied := make(chan error, 1)
-		go func() {
-			_, _, err := cli.SendRequest("keepalive@openssh.com", true, nil)
-			replied <- err
-		}()
-		select {
 		case err := <-replied:
 			if err != nil {
-				d.closeSSHClient(cli)
 				return
 			}
-		case <-time.After(interval):
-			d.closeSSHClient(cli)
-			return
-		case <-dead:
-			return
+			replied = nil
+		case <-timer.C:
+			n := record.arrived()
+			switch {
+			case record.ended():
+				// SendRequest spins forever on a mux that has shut down.
+				return
+			case replied == nil:
+				replied = make(chan error, 1)
+				go func(replied chan<- error) {
+					_, _, err := cli.SendRequest("keepalive@openssh.com", true, nil)
+					replied <- err
+				}(replied)
+			case n == arrived:
+				// The reply may queue behind data still arriving, so only silence closes.
+				return
+			}
+			arrived = n
+			timer.Reset(interval)
 		}
 	}
 }
