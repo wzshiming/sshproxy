@@ -519,14 +519,27 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	return conn, nil
 }
 
+// Dial connects to the address from the remote host. Having no context to
+// bound it, the wait for the remote host to open the connection is limited by
+// the timeout of the Dialer, as is the connection to the SSH server itself.
 func (d *Dialer) Dial(network, address string) (net.Conn, error) {
-	cli, err := d.SSHClient(context.Background())
+	ctx := context.Background()
+	cli, err := d.SSHClient(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := cli.Dial(network, address)
+	timeout := d.config.Timeout
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	conn, err := cli.DialContext(ctx, network, address)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("ssh: dialing %s through %s exceeded the %v timeout: %w", address, d.host, timeout, err)
+		}
 		return nil, err
 	}
 
