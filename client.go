@@ -3,6 +3,7 @@ package sshproxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -34,7 +35,12 @@ func NewDialer(addr string) (*Dialer, error) {
 	return d, nil
 }
 
+// NewDialerWithConfig returns a new Dialer that dials through the SSH server
+// at host, an address of the form host:port, with the given client config.
 func NewDialerWithConfig(host string, config *ssh.ClientConfig) (*Dialer, error) {
+	if config == nil {
+		return nil, errors.New("ssh: client config is nil")
+	}
 	return &Dialer{
 		host:        host,
 		config:      config,
