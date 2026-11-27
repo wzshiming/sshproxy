@@ -11,8 +11,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1633,5 +1638,327 @@ func TestHostKeyVerify(t *testing.T) {
 	_, err = badDial.SSHClient(context.Background())
 	if err == nil {
 		t.Fatal("expected host key mismatch error")
+	}
+}
+
+// dialTiedToContext is a ProxyDial hook whose connections live only as long as their context.
+func dialTiedToContext(ctx context.Context, network, address string) (net.Conn, error) {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	context.AfterFunc(ctx, func() { conn.Close() })
+	return conn, nil
+}
+
+func TestPooledClientOutlivesFirstCallerContext(t *testing.T) {
+	dial := newTestDialer(t, "?keepalive=0")
+	dial.ProxyDial = dialTiedToContext
+	ctx, cancel := context.WithCancel(context.Background())
+	cli1, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+	cli2, err := dial.SSHClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cli2 != cli1 {
+		t.Fatal("pooled client was replaced after the context of its first caller ended")
+	}
+	conn, err := cli2.DialContext(context.Background(), "tcp", newEchoListener(t).Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	assertEcho(t, conn)
+}
+
+func TestCanceledContextAbortsProxyDial(t *testing.T) {
+	dial := newTestDialer(t, "?timeout=5s")
+	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	_, elapsed, err := func() (*ssh.Client, time.Duration, error) {
+		start := time.Now()
+		cli, err := dial.SSHClient(ctx)
+		return cli, time.Since(start), err
+	}()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SSHClient error = %v, want context.Canceled", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("SSHClient took %v to notice its canceled context", elapsed)
+	}
+}
+
+// dialGated is a ProxyDial hook that counts its calls and holds each one until release is closed.
+func dialGated(calls *atomic.Int32, release <-chan struct{}) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		calls.Add(1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, address)
+	}
+}
+
+func TestDialingDoesNotBlockPooledClient(t *testing.T) {
+	dial := newTestDialer(t, "?connections=2")
+	cli1, err := dial.SSHClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	release := make(chan struct{})
+	dial.ProxyDial = dialGated(&calls, release)
+	second := make(chan *ssh.Client, 1)
+	go func() {
+		cli, _ := dial.SSHClient(context.Background())
+		second <- cli
+	}()
+	for calls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	cli3, elapsed, err := sshClientWithin(t, dial, 2*time.Second)
+	if err != nil {
+		t.Fatalf("SSHClient while another client is being dialed: %v (after %v)", err, elapsed)
+	}
+	if cli3 != cli1 {
+		t.Fatal("SSHClient did not reuse the pooled client while another is being dialed")
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("ProxyDial ran %d times, want 1", n)
+	}
+	close(release)
+	if cli2 := <-second; cli2 == nil || cli2 == cli1 {
+		t.Fatal("the dial in flight did not add a second client")
+	}
+}
+
+func TestConcurrentCallersShareOneDial(t *testing.T) {
+	dial := newTestDialer(t, "")
+	var calls atomic.Int32
+	release := make(chan struct{})
+	dial.ProxyDial = dialGated(&calls, release)
+	const callers = 8
+	clients := make(chan *ssh.Client, callers)
+	for range callers {
+		go func() {
+			cli, err := dial.SSHClient(context.Background())
+			if err != nil {
+				t.Error(err)
+			}
+			clients <- cli
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	first := <-clients
+	for range callers - 1 {
+		if cli := <-clients; cli != first {
+			t.Fatal("concurrent callers got different clients from a pool of one")
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("ProxyDial ran %d times, want 1", n)
+	}
+}
+
+func TestWaitingCallerDialsAfterFailedDial(t *testing.T) {
+	dial := newTestDialer(t, "")
+	var calls atomic.Int32
+	failed := make(chan struct{})
+	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if calls.Add(1) == 1 {
+			<-failed
+			return nil, errors.New("refused")
+		}
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, address)
+	}
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := dial.SSHClient(context.Background())
+		firstErr <- err
+	}()
+	for calls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	waiting := make(chan error, 1)
+	go func() {
+		_, err := dial.SSHClient(context.Background())
+		waiting <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(failed)
+	if err := <-firstErr; err == nil {
+		t.Fatal("the failing dial succeeded")
+	}
+	select {
+	case err := <-waiting:
+		if err != nil {
+			t.Fatalf("caller waiting on a dial that failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller waiting on a dial that failed never returned")
+	}
+}
+
+func TestWaitingCallerHonorsItsContext(t *testing.T) {
+	dial := newTestDialer(t, "")
+	var calls atomic.Int32
+	release := make(chan struct{})
+	defer close(release)
+	dial.ProxyDial = dialGated(&calls, release)
+	go dial.SSHClient(context.Background())
+	for calls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := dial.SSHClient(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SSHClient error = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("waiting caller took %v to notice its context", elapsed)
+	}
+}
+
+func TestCloseDiscardsClientDialedAcrossIt(t *testing.T) {
+	dial := newTestDialer(t, "")
+	var calls atomic.Int32
+	release := make(chan struct{})
+	dial.ProxyDial = dialGated(&calls, release)
+	result := make(chan error, 1)
+	go func() {
+		_, err := dial.SSHClient(context.Background())
+		result <- err
+	}()
+	for calls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if err := dial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-result; !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("SSHClient across Close: error = %v, want net.ErrClosed", err)
+	}
+	dial.mut.Lock()
+	pooled := len(dial.sshCli)
+	dial.mut.Unlock()
+	if pooled != 0 {
+		t.Fatalf("pool holds %d clients after Close", pooled)
+	}
+}
+
+func TestBuildCmdQuotesArgumentsForShell(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh to check the quoting against")
+	}
+	args := []string{
+		"plain",
+		"",
+		"two words",
+		"$HOME",
+		"`echo injected`",
+		"$(echo injected)",
+		"it's",
+		`"double"`,
+		`back\slash`,
+		"semi;colon && and | pipe > redirect",
+		"new\nline",
+		"tab\there",
+		"*",
+		"~",
+		"!history",
+		"#comment",
+	}
+	out, err := exec.Command(sh, "-c", buildCmd(`printf '%s\0'`, args...)).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+	if !slices.Equal(got, args) {
+		t.Fatalf("shell saw arguments %q, want %q", got, args)
+	}
+}
+
+func TestHomeDirConfinesUserName(t *testing.T) {
+	privData, pubData := genHostKey(t)
+	pub, err := base64.URLEncoding.DecodeString(pubData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	for _, dir := range []string{
+		filepath.Join(home, "alice", ".ssh"),
+		filepath.Join(root, "outside", ".ssh"),
+		filepath.Join(home, ".ssh"),
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "authorized_keys"), pub, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "permissions.json"), []byte(`{"direct-tcpip":{"default":true}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := NewSimpleServer("ssh://:0?permissions_file_name=permissions.json&home_dir=" + url.QueryEscape(home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for _, test := range []struct {
+		user    string
+		wantErr bool
+	}{
+		{user: "alice"},
+		{user: "../outside", wantErr: true},
+		{user: "alice/../../outside", wantErr: true},
+		{user: `..\outside`, wantErr: true},
+		{user: "..", wantErr: true},
+		{user: ".", wantErr: true},
+		{user: "", wantErr: true},
+		{user: "bob", wantErr: true},
+	} {
+		t.Run(test.user, func(t *testing.T) {
+			u := url.URL{Scheme: "ssh", User: url.User(test.user), Host: s.Address, RawQuery: "identity_data=" + privData}
+			dial, err := NewDialer(u.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dial.Close()
+			_, err = dial.SSHClient(context.Background())
+			if test.wantErr && err == nil {
+				t.Fatalf("user %q logged in with a key from outside its home directory", test.user)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("user %q: %v", test.user, err)
+			}
+			if allowed := s.UserPermissions(test.user).Allow("direct-tcpip", "127.0.0.1:1"); allowed == test.wantErr && test.user != "bob" {
+				t.Fatalf("permissions of user %q: allowed = %v, want %v", test.user, allowed, !test.wantErr)
+			}
+		})
 	}
 }

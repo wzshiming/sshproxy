@@ -32,6 +32,11 @@ func init() {
 
 func main() {
 	logger := log.New(os.Stderr, "[ssh proxy] ", log.LstdFlags)
+	if (username == "") != (password == "") {
+		// One without the other would leave the server open or unusable.
+		logger.Println("username (-u) and password (-p) must be set together")
+		os.Exit(2)
+	}
 	svc := sshd.NewServer()
 	svc.Logger = logger
 	if hostkey != "" {
@@ -71,7 +76,7 @@ func main() {
 			return nil, fmt.Errorf("denied")
 		}
 	}
-	if username == "" && authorized == "" {
+	if svc.ServerConfig.PasswordCallback == nil && svc.ServerConfig.PublicKeyCallback == nil {
 		svc.ServerConfig.NoClientAuth = true
 	}
 	err := svc.ListenAndServe("tcp", address)

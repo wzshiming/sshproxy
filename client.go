@@ -193,9 +193,12 @@ type Dialer struct {
 	host   string
 	config *ssh.ClientConfig
 
-	mut    sync.Mutex
-	sshCli []pooledClient
-	next   int
+	mut     sync.Mutex
+	sshCli  []pooledClient
+	next    int
+	dialing int           // clients being dialed outside mut
+	dialed  chan struct{} // non-nil while a caller waits; closed as a dial finishes
+	closes  int           // times Close ran, to discard clients dialed across it
 }
 
 type pooledClient struct {
@@ -206,6 +209,7 @@ type pooledClient struct {
 func (d *Dialer) Close() error {
 	d.mut.Lock()
 	defer d.mut.Unlock()
+	d.closes++
 	d.purgeEnded()
 	if len(d.sshCli) == 0 {
 		return nil
@@ -277,38 +281,94 @@ func (d *Dialer) proxyDial(ctx context.Context, network, address string) (net.Co
 	return proxyDial(ctx, network, address)
 }
 
+// SSHClient returns a pooled SSH client, dialing a new one while the pool is
+// below Connections. Dialing does not block callers a pooled client can serve.
 func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 	d.mut.Lock()
-	defer d.mut.Unlock()
-
-	d.purgeEnded()
-
-	connections := d.connections()
-
-	if len(d.sshCli) > 0 && len(d.sshCli) >= connections {
-		idx := d.next % len(d.sshCli)
-		d.next = (d.next + 1) % len(d.sshCli)
-		return d.sshCli[idx].Client, nil
+	for {
+		d.purgeEnded()
+		connections := d.connections()
+		if len(d.sshCli) > 0 && len(d.sshCli)+d.dialing >= connections {
+			idx := d.next % len(d.sshCli)
+			d.next = (d.next + 1) % len(d.sshCli)
+			sshCli := d.sshCli[idx].Client
+			d.mut.Unlock()
+			return sshCli, nil
+		}
+		if d.dialing < connections {
+			break
+		}
+		// Every connection is being dialed by another caller: share its result.
+		if d.dialed == nil {
+			d.dialed = make(chan struct{})
+		}
+		dialed := d.dialed
+		d.mut.Unlock()
+		select {
+		case <-dialed:
+		case <-ctx.Done():
+			return nil, context.Cause(ctx)
+		}
+		d.mut.Lock()
 	}
+	d.dialing++
+	closes := d.closes
+	d.mut.Unlock()
 
+	sshCli, record, err := d.dialSSHClient(ctx)
+
+	d.mut.Lock()
+	defer d.mut.Unlock()
+	d.dialing--
+	if d.dialed != nil {
+		close(d.dialed)
+		d.dialed = nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if d.closes != closes {
+		sshCli.Close()
+		return nil, fmt.Errorf("ssh: dialer closed while connecting to %s: %w", d.host, net.ErrClosed)
+	}
+	d.sshCli = append(d.sshCli, pooledClient{Client: sshCli, record: record})
+	if interval := d.KeepAlive; interval > 0 {
+		go d.keepAlive(sshCli, interval, record)
+	}
+	if len(d.sshCli) == 1 {
+		d.next = 0
+	}
+	return sshCli, nil
+}
+
+// dialSSHClient dials and handshakes a new SSH client within the timeout.
+func (d *Dialer) dialSSHClient(ctx context.Context) (*ssh.Client, *connRecord, error) {
 	var deadline time.Time
 	if timeout := d.config.Timeout; timeout > 0 {
 		deadline = time.Now().Add(timeout)
 	}
 	// Live until its conn ends: a ProxyDial conn may live only as long as its ctx.
-	dialCtx, cancelDial := context.WithCancel(ctx)
+	// The conn is shared by later callers, so ctx only cancels the dial itself.
+	dialCtx, cancelDial := context.WithCancel(context.WithoutCancel(ctx))
 
 	stopLimit := atDeadline(deadline, cancelDial)
+	stopCancel := context.AfterFunc(ctx, cancelDial)
 	conn, err := d.proxyDial(dialCtx, "tcp", d.host)
+	canceled := !stopCancel()
 	if !stopLimit() {
 		if err == nil {
 			conn.Close()
 		}
 		err = d.timeoutError()
+	} else if canceled {
+		if err == nil {
+			conn.Close()
+			err = context.Cause(ctx)
+		}
 	}
 	if err != nil {
 		cancelDial()
-		return nil, err
+		return nil, nil, err
 	}
 	record := newConnRecord(conn)
 	record.onEnd = cancelDial
@@ -319,22 +379,13 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 		if err == nil {
 			con.Close()
 		}
-		return nil, d.timeoutError()
+		return nil, nil, d.timeoutError()
 	}
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, err
 	}
-
-	sshCli := ssh.NewClient(con, chans, reqs)
-	d.sshCli = append(d.sshCli, pooledClient{Client: sshCli, record: record})
-	if interval := d.KeepAlive; interval > 0 {
-		go d.keepAlive(sshCli, interval, record)
-	}
-	if len(d.sshCli) == 1 {
-		d.next = 0
-	}
-	return sshCli, nil
+	return ssh.NewClient(con, chans, reqs), record, nil
 }
 
 // atDeadline runs f at a non-zero deadline; stop prevents that and reports whether it did.
@@ -386,13 +437,21 @@ func (d *Dialer) keepAlive(cli *ssh.Client, interval time.Duration, record *conn
 	}
 }
 
+// buildCmd joins name and args into a command line for the remote shell.
+// name is passed as is, so it may itself be a shell command line; every
+// argument is quoted so the shell passes it on unchanged.
 func buildCmd(name string, args ...string) string {
 	cmds := make([]string, 0, len(args)+1)
 	cmds = append(cmds, name)
 	for _, arg := range args {
-		cmds = append(cmds, strconv.Quote(arg))
+		cmds = append(cmds, shellQuote(arg))
 	}
 	return strings.Join(cmds, " ")
+}
+
+// shellQuote quotes s as a single word of a POSIX shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // CommandDialContext executes a command on the remote host and returns a

@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"path"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/wzshiming/sshd"
@@ -128,12 +129,15 @@ func serverConfig(addr string) (user, pwd, host string, config *ssh.ServerConfig
 			authorizedFileName = authorizedFileNames[0]
 		}
 		pks = append(pks, func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			file := path.Join(homeDir, conn.User(), sshDirName, authorizedFileName)
+			file, ok := userFile(homeDir, conn.User(), sshDirName, authorizedFileName)
+			if !ok {
+				return nil, fmt.Errorf("denied")
+			}
 			keys, err := sshd.GetAuthorizedFile(file)
 			if err != nil {
 				return nil, fmt.Errorf("denied")
 			}
-			ok, _ := keys.Allow(key)
+			ok, _ = keys.Allow(key)
 			if ok {
 				return nil, nil
 			}
@@ -154,7 +158,10 @@ func serverConfig(addr string) (user, pwd, host string, config *ssh.ServerConfig
 				permissionsFileUpdatePeriod, _ = time.ParseDuration(permissionsFileUpdatePeriods[0])
 			}
 			userPermissions = func(user string) sshd.Permissions {
-				file := path.Join(homeDir, user, sshDirName, permissionsFileName)
+				file, ok := userFile(homeDir, user, sshDirName, permissionsFileName)
+				if !ok {
+					return permissions.Permissions{}
+				}
 				return permissions.NewPermissionsFromFile(file, permissionsFileUpdatePeriod)
 			}
 		}
@@ -189,6 +196,16 @@ func serverConfig(addr string) (user, pwd, host string, config *ssh.ServerConfig
 	}
 	host = net.JoinHostPort(host, port)
 	return user, pwd, host, config, userPermissions, nil
+}
+
+// userFile returns the path of the named file in the ssh directory of user
+// under homeDir. It reports false for a user name that is not a single path
+// element, which would otherwise select a directory outside homeDir.
+func userFile(homeDir, user, sshDirName, name string) (string, bool) {
+	if user == "" || user == "." || user == ".." || strings.ContainsAny(user, "/\\\x00") {
+		return "", false
+	}
+	return filepath.Join(homeDir, user, sshDirName, name), true
 }
 
 // Run the server
