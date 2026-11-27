@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,29 @@ type connCloser struct {
 
 func (w *connCloser) Close() error {
 	return w.closer()
+}
+
+// connWithRelease runs release as the connection is closed.
+func connWithRelease(conn net.Conn, release func()) net.Conn {
+	return &connRelease{Conn: conn, release: release}
+}
+
+type connRelease struct {
+	net.Conn
+	release func()
+}
+
+func (w *connRelease) Close() error {
+	w.release()
+	return w.Conn.Close()
+}
+
+// CloseWrite keeps the half-close of the wrapped SSH channel reachable.
+func (w *connRelease) CloseWrite() error {
+	if conn, ok := w.Conn.(interface{ CloseWrite() error }); ok {
+		return conn.CloseWrite()
+	}
+	return errors.ErrUnsupported
 }
 
 func connWithAddr(conn net.Conn, localAddr, remoteAddr net.Addr) net.Conn {

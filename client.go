@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -208,6 +209,7 @@ type Dialer struct {
 type pooledClient struct {
 	*ssh.Client
 	record *connRecord
+	active *atomic.Int64 // connections the Dialer has open through the client
 }
 
 func (d *Dialer) Close() error {
@@ -286,15 +288,16 @@ func (d *Dialer) proxyDial(ctx context.Context, network, address string) (net.Co
 }
 
 // SSHClient returns a pooled SSH client, dialing a new one while the pool is
-// below Connections. Dialing does not block callers a pooled client can serve.
+// below Connections. A full pool hands out the client with the fewest
+// connections opened through the Dialer, taking equally loaded clients in turn. Dialing does not block callers a pooled client can serve.
 func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 	d.mut.Lock()
 	for {
 		d.purgeEnded()
 		connections := d.connections()
 		if len(d.sshCli) > 0 && len(d.sshCli)+d.dialing >= connections {
-			idx := d.next % len(d.sshCli)
-			d.next = (d.next + 1) % len(d.sshCli)
+			idx := d.leastLoaded()
+			d.next = (idx + 1) % len(d.sshCli)
 			sshCli := d.sshCli[idx].Client
 			d.mut.Unlock()
 			return sshCli, nil
@@ -335,7 +338,7 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 		sshCli.Close()
 		return nil, fmt.Errorf("ssh: dialer closed while connecting to %s: %w", d.host, net.ErrClosed)
 	}
-	d.sshCli = append(d.sshCli, pooledClient{Client: sshCli, record: record})
+	d.sshCli = append(d.sshCli, pooledClient{Client: sshCli, record: record, active: new(atomic.Int64)})
 	if interval := d.KeepAlive; interval > 0 {
 		go d.keepAlive(sshCli, interval, record)
 	}
@@ -343,6 +346,36 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 		d.next = 0
 	}
 	return sshCli, nil
+}
+
+// leastLoaded returns the index of the pooled client with the fewest open
+// connections, taking equally loaded clients in turn. It requires d.mut to be
+// held and the pool not to be empty.
+func (d *Dialer) leastLoaded() int {
+	start := d.next % len(d.sshCli)
+	best := start
+	for i := 1; i < len(d.sshCli); i++ {
+		idx := (start + i) % len(d.sshCli)
+		if d.sshCli[idx].active.Load() < d.sshCli[best].active.Load() {
+			best = idx
+		}
+	}
+	return best
+}
+
+// acquire counts a connection opened through a pooled client until the
+// returned release is called. Further calls of release do nothing.
+func (d *Dialer) acquire(sshCli *ssh.Client) (release func()) {
+	d.mut.Lock()
+	defer d.mut.Unlock()
+	for i := range d.sshCli {
+		if d.sshCli[i].Client == sshCli {
+			active := d.sshCli[i].active
+			active.Add(1)
+			return sync.OnceFunc(func() { active.Add(-1) })
+		}
+	}
+	return func() {}
 }
 
 // dialSSHClient dials and handshakes a new SSH client within the timeout.
@@ -488,6 +521,7 @@ func (d *Dialer) CommandDialContext(ctx context.Context, name string, args ...st
 		conn1.Close()
 		return nil, err
 	}
+	release := d.acquire(cli)
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		sess.Wait()
@@ -495,6 +529,7 @@ func (d *Dialer) CommandDialContext(ctx context.Context, name string, args ...st
 	}()
 	go func() {
 		<-ctx.Done()
+		release()
 
 		// openssh does not support the signal
 		// command and will not signal remote processes. This may
@@ -523,7 +558,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 		return nil, err
 	}
 
-	return conn, nil
+	return connWithRelease(conn, d.acquire(cli)), nil
 }
 
 // Dial connects to the address from the remote host. Having no context to
@@ -550,7 +585,7 @@ func (d *Dialer) Dial(network, address string) (net.Conn, error) {
 		return nil, err
 	}
 
-	return conn, nil
+	return connWithRelease(conn, d.acquire(cli)), nil
 }
 
 func (d *Dialer) Listen(ctx context.Context, network, address string) (net.Listener, error) {
