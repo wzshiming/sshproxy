@@ -30,13 +30,22 @@ func openDatas(datas []string) ([][]byte, error) {
 		if s == "" {
 			continue
 		}
-		data, err := base64.URLEncoding.DecodeString(s)
+		data, err := decodeBase64(s)
 		if err != nil {
 			return nil, err
 		}
 		ret = append(ret, data)
 	}
 	return ret, nil
+}
+
+// decodeBase64 decodes base64 in the URL-safe or the standard alphabet, with
+// or without padding. A '+' of the standard alphabet arrives as a space when
+// it was written unescaped in a query string, and is read as such.
+func decodeBase64(s string) ([]byte, error) {
+	s = strings.TrimRight(s, "=")
+	s = strings.NewReplacer("-", "+", "_", "/", " ", "+").Replace(s)
+	return base64.RawStdEncoding.DecodeString(s)
 }
 
 func openFiles(files []string) ([][]byte, error) {
