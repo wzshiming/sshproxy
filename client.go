@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -189,6 +190,9 @@ type Dialer struct {
 	// interval passes with neither its reply nor any byte arriving. Zero disables
 	// keepalives; the default is 30s.
 	KeepAlive time.Duration
+	// Stderr receives the standard error of commands run by CommandDialContext.
+	// If nil, os.Stderr is used; set it to io.Discard to drop the output.
+	Stderr io.Writer
 
 	host   string
 	config *ssh.ClientConfig
@@ -472,7 +476,10 @@ func (d *Dialer) CommandDialContext(ctx context.Context, name string, args ...st
 	conn1, conn2 := net.Pipe()
 	sess.Stdin = conn1
 	sess.Stdout = conn1
-	sess.Stderr = os.Stderr
+	sess.Stderr = d.Stderr
+	if sess.Stderr == nil {
+		sess.Stderr = os.Stderr
+	}
 
 	cmd := buildCmd(name, args...)
 	err = sess.Start(cmd)
