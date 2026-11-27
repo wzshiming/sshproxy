@@ -2,6 +2,7 @@
 
 SSH Proxy server and client
 
+[![Test](https://github.com/wzshiming/sshproxy/actions/workflows/test.yml/badge.svg)](https://github.com/wzshiming/sshproxy/actions/workflows/test.yml)
 [![Build](https://github.com/wzshiming/sshproxy/actions/workflows/go-cross-build.yml/badge.svg)](https://github.com/wzshiming/sshproxy/actions/workflows/go-cross-build.yml)
 [![GoDoc](https://pkg.go.dev/badge/github.com/wzshiming/sshproxy)](https://pkg.go.dev/github.com/wzshiming/sshproxy)
 [![GitHub license](https://img.shields.io/github/license/wzshiming/sshproxy.svg)](https://github.com/wzshiming/sshproxy/blob/master/LICENSE)
