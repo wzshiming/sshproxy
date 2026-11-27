@@ -11,7 +11,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -1891,5 +1894,71 @@ func TestBuildCmdQuotesArgumentsForShell(t *testing.T) {
 	got := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
 	if !slices.Equal(got, args) {
 		t.Fatalf("shell saw arguments %q, want %q", got, args)
+	}
+}
+
+func TestHomeDirConfinesUserName(t *testing.T) {
+	privData, pubData := genHostKey(t)
+	pub, err := base64.URLEncoding.DecodeString(pubData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	for _, dir := range []string{
+		filepath.Join(home, "alice", ".ssh"),
+		filepath.Join(root, "outside", ".ssh"),
+		filepath.Join(home, ".ssh"),
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "authorized_keys"), pub, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "permissions.json"), []byte(`{"direct-tcpip":{"default":true}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := NewSimpleServer("ssh://:0?permissions_file_name=permissions.json&home_dir=" + url.QueryEscape(home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for _, test := range []struct {
+		user    string
+		wantErr bool
+	}{
+		{user: "alice"},
+		{user: "../outside", wantErr: true},
+		{user: "alice/../../outside", wantErr: true},
+		{user: `..\outside`, wantErr: true},
+		{user: "..", wantErr: true},
+		{user: ".", wantErr: true},
+		{user: "", wantErr: true},
+		{user: "bob", wantErr: true},
+	} {
+		t.Run(test.user, func(t *testing.T) {
+			u := url.URL{Scheme: "ssh", User: url.User(test.user), Host: s.Address, RawQuery: "identity_data=" + privData}
+			dial, err := NewDialer(u.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dial.Close()
+			_, err = dial.SSHClient(context.Background())
+			if test.wantErr && err == nil {
+				t.Fatalf("user %q logged in with a key from outside its home directory", test.user)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("user %q: %v", test.user, err)
+			}
+			if allowed := s.UserPermissions(test.user).Allow("direct-tcpip", "127.0.0.1:1"); allowed == test.wantErr && test.user != "bob" {
+				t.Fatalf("permissions of user %q: allowed = %v, want %v", test.user, allowed, !test.wantErr)
+			}
+		})
 	}
 }
