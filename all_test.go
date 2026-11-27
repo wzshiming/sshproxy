@@ -1635,3 +1635,60 @@ func TestHostKeyVerify(t *testing.T) {
 		t.Fatal("expected host key mismatch error")
 	}
 }
+
+// dialTiedToContext is a ProxyDial hook whose connections live only as long as their context.
+func dialTiedToContext(ctx context.Context, network, address string) (net.Conn, error) {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	context.AfterFunc(ctx, func() { conn.Close() })
+	return conn, nil
+}
+
+func TestPooledClientOutlivesFirstCallerContext(t *testing.T) {
+	dial := newTestDialer(t, "?keepalive=0")
+	dial.ProxyDial = dialTiedToContext
+	ctx, cancel := context.WithCancel(context.Background())
+	cli1, err := dial.SSHClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+	cli2, err := dial.SSHClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cli2 != cli1 {
+		t.Fatal("pooled client was replaced after the context of its first caller ended")
+	}
+	conn, err := cli2.DialContext(context.Background(), "tcp", newEchoListener(t).Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	assertEcho(t, conn)
+}
+
+func TestCanceledContextAbortsProxyDial(t *testing.T) {
+	dial := newTestDialer(t, "?timeout=5s")
+	dial.ProxyDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	_, elapsed, err := func() (*ssh.Client, time.Duration, error) {
+		start := time.Now()
+		cli, err := dial.SSHClient(ctx)
+		return cli, time.Since(start), err
+	}()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SSHClient error = %v, want context.Canceled", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("SSHClient took %v to notice its canceled context", elapsed)
+	}
+}

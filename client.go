@@ -296,15 +296,23 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 		deadline = time.Now().Add(timeout)
 	}
 	// Live until its conn ends: a ProxyDial conn may live only as long as its ctx.
-	dialCtx, cancelDial := context.WithCancel(ctx)
+	// The conn is shared by later callers, so ctx only cancels the dial itself.
+	dialCtx, cancelDial := context.WithCancel(context.WithoutCancel(ctx))
 
 	stopLimit := atDeadline(deadline, cancelDial)
+	stopCancel := context.AfterFunc(ctx, cancelDial)
 	conn, err := d.proxyDial(dialCtx, "tcp", d.host)
+	canceled := !stopCancel()
 	if !stopLimit() {
 		if err == nil {
 			conn.Close()
 		}
 		err = d.timeoutError()
+	} else if canceled {
+		if err == nil {
+			conn.Close()
+			err = context.Cause(ctx)
+		}
 	}
 	if err != nil {
 		cancelDial()
