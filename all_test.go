@@ -11,8 +11,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1856,5 +1858,38 @@ func TestCloseDiscardsClientDialedAcrossIt(t *testing.T) {
 	dial.mut.Unlock()
 	if pooled != 0 {
 		t.Fatalf("pool holds %d clients after Close", pooled)
+	}
+}
+
+func TestBuildCmdQuotesArgumentsForShell(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh to check the quoting against")
+	}
+	args := []string{
+		"plain",
+		"",
+		"two words",
+		"$HOME",
+		"`echo injected`",
+		"$(echo injected)",
+		"it's",
+		`"double"`,
+		`back\slash`,
+		"semi;colon && and | pipe > redirect",
+		"new\nline",
+		"tab\there",
+		"*",
+		"~",
+		"!history",
+		"#comment",
+	}
+	out, err := exec.Command(sh, "-c", buildCmd(`printf '%s\0'`, args...)).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+	if !slices.Equal(got, args) {
+		t.Fatalf("shell saw arguments %q, want %q", got, args)
 	}
 }

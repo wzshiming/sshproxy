@@ -437,13 +437,21 @@ func (d *Dialer) keepAlive(cli *ssh.Client, interval time.Duration, record *conn
 	}
 }
 
+// buildCmd joins name and args into a command line for the remote shell.
+// name is passed as is, so it may itself be a shell command line; every
+// argument is quoted so the shell passes it on unchanged.
 func buildCmd(name string, args ...string) string {
 	cmds := make([]string, 0, len(args)+1)
 	cmds = append(cmds, name)
 	for _, arg := range args {
-		cmds = append(cmds, strconv.Quote(arg))
+		cmds = append(cmds, shellQuote(arg))
 	}
 	return strings.Join(cmds, " ")
+}
+
+// shellQuote quotes s as a single word of a POSIX shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // CommandDialContext executes a command on the remote host and returns a
