@@ -2,6 +2,8 @@ package sshproxy
 
 import (
 	"net"
+	"sync"
+	"sync/atomic"
 )
 
 func connWithCloser(conn net.Conn, closer func() error) net.Conn {
@@ -39,6 +41,68 @@ func (w *connAddr) RemoteAddr() net.Addr {
 		return w.Conn.RemoteAddr()
 	}
 	return w.remoteAddr
+}
+
+func newConnRecord(conn net.Conn) *connRecord {
+	return &connRecord{Conn: conn, end: make(chan struct{})}
+}
+
+// connRecord counts the bytes read from a connection and notes its end.
+type connRecord struct {
+	net.Conn
+	read    atomic.Int64
+	end     chan struct{}
+	endOnce sync.Once
+	onEnd   func() // optional, runs once as the connection ends
+}
+
+func (w *connRecord) Read(b []byte) (int, error) {
+	n, err := w.Conn.Read(b)
+	w.read.Add(int64(n))
+	if err != nil {
+		w.markEnded()
+	}
+	return n, err
+}
+
+func (w *connRecord) Write(b []byte) (int, error) {
+	n, err := w.Conn.Write(b)
+	if err != nil {
+		w.markEnded()
+	}
+	return n, err
+}
+
+func (w *connRecord) Close() error {
+	err := w.Conn.Close()
+	w.markEnded()
+	return err
+}
+
+func (w *connRecord) markEnded() {
+	w.endOnce.Do(func() {
+		if w.onEnd != nil {
+			w.onEnd()
+		}
+		close(w.end)
+	})
+}
+
+func (w *connRecord) ended() bool {
+	select {
+	case <-w.end:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *connRecord) done() <-chan struct{} {
+	return w.end
+}
+
+func (w *connRecord) arrived() int64 {
+	return w.read.Load()
 }
 
 func newNetAddr(network, address string) net.Addr {

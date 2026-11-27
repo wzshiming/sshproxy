@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,7 +16,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const defaultKeepAlive time.Duration = 0
+const defaultKeepAlive time.Duration = 30 * time.Second
 
 // NewDialer returns a new Dialer that dials through the provided
 // proxy server's network and address.
@@ -38,6 +39,7 @@ func NewDialerWithConfig(host string, config *ssh.ClientConfig) (*Dialer, error)
 		host:        host,
 		config:      config,
 		Connections: 1,
+		KeepAlive:   defaultKeepAlive,
 	}, nil
 }
 
@@ -107,8 +109,8 @@ func parseClientConfig(addr string) (*clientConfig, error) {
 	timeoutStr := ur.Query().Get("timeout")
 	if timeoutStr != "" {
 		timeout, err = time.ParseDuration(timeoutStr)
-		if err != nil {
-			return nil, err
+		if err != nil || timeout < 0 {
+			return nil, fmt.Errorf("invalid timeout: %q", timeoutStr)
 		}
 	}
 
@@ -183,31 +185,34 @@ type Dialer struct {
 	// Values less than or equal to 0 are treated as 1.
 	Connections int
 	// KeepAlive is the interval between keepalive@openssh.com global requests on
-	// every pooled client. A client is closed if neither a success nor a failure
-	// reply arrives within one interval. Zero disables keepalives (the default),
-	// matching OpenSSH's ServerAliveInterval default.
+	// every pooled client. A client is closed if a request errors, or if a whole
+	// interval passes with neither its reply nor any byte arriving. Zero disables
+	// keepalives; the default is 30s.
 	KeepAlive time.Duration
 
 	host   string
 	config *ssh.ClientConfig
 
 	mut    sync.Mutex
-	sshCli []*ssh.Client
+	sshCli []pooledClient
 	next   int
+}
+
+type pooledClient struct {
+	*ssh.Client
+	record *connRecord
 }
 
 func (d *Dialer) Close() error {
 	d.mut.Lock()
 	defer d.mut.Unlock()
+	d.purgeEnded()
 	if len(d.sshCli) == 0 {
 		return nil
 	}
 
 	var firstErr error
 	for _, sshCli := range d.sshCli {
-		if sshCli == nil {
-			continue
-		}
 		err := sshCli.Close()
 		if firstErr == nil {
 			firstErr = err
@@ -235,7 +240,7 @@ func (d *Dialer) closeSSHClient(sshCli *ssh.Client) error {
 	defer d.mut.Unlock()
 
 	for i := range d.sshCli {
-		if d.sshCli[i] != sshCli {
+		if d.sshCli[i].Client != sshCli {
 			continue
 		}
 
@@ -252,6 +257,17 @@ func (d *Dialer) closeSSHClient(sshCli *ssh.Client) error {
 	return sshCli.Close()
 }
 
+// purgeEnded requires d.mut to be held.
+func (d *Dialer) purgeEnded() {
+	d.sshCli = slices.DeleteFunc(d.sshCli, func(sshCli pooledClient) bool {
+		ended := sshCli.record.ended()
+		if ended {
+			sshCli.Close()
+		}
+		return ended
+	})
+}
+
 func (d *Dialer) proxyDial(ctx context.Context, network, address string) (net.Conn, error) {
 	proxyDial := d.ProxyDial
 	if proxyDial == nil {
@@ -265,35 +281,55 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 	d.mut.Lock()
 	defer d.mut.Unlock()
 
+	d.purgeEnded()
+
 	connections := d.connections()
 
 	if len(d.sshCli) > 0 && len(d.sshCli) >= connections {
 		idx := d.next % len(d.sshCli)
 		d.next = (d.next + 1) % len(d.sshCli)
-		return d.sshCli[idx], nil
+		return d.sshCli[idx].Client, nil
 	}
 
-	conn, err := d.proxyDial(ctx, "tcp", d.host)
+	var deadline time.Time
+	if timeout := d.config.Timeout; timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	// Live until its conn ends: a ProxyDial conn may live only as long as its ctx.
+	dialCtx, cancelDial := context.WithCancel(ctx)
+
+	stopLimit := atDeadline(deadline, cancelDial)
+	conn, err := d.proxyDial(dialCtx, "tcp", d.host)
+	if !stopLimit() {
+		if err == nil {
+			conn.Close()
+		}
+		err = d.timeoutError()
+	}
 	if err != nil {
+		cancelDial()
 		return nil, err
 	}
+	record := newConnRecord(conn)
+	record.onEnd = cancelDial
 
-	con, chans, reqs, err := ssh.NewClientConn(conn, d.host, d.config)
+	stopLimit = atDeadline(deadline, func() { conn.Close() })
+	con, chans, reqs, err := ssh.NewClientConn(record, d.host, d.config)
+	if !stopLimit() {
+		if err == nil {
+			con.Close()
+		}
+		return nil, d.timeoutError()
+	}
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 
 	sshCli := ssh.NewClient(con, chans, reqs)
-	d.sshCli = append(d.sshCli, sshCli)
-	dead := make(chan struct{})
-	go func() {
-		sshCli.Wait()
-		close(dead)
-		d.closeSSHClient(sshCli)
-	}()
+	d.sshCli = append(d.sshCli, pooledClient{Client: sshCli, record: record})
 	if interval := d.KeepAlive; interval > 0 {
-		go d.keepAlive(sshCli, interval, dead)
+		go d.keepAlive(sshCli, interval, record)
 	}
 	if len(d.sshCli) == 1 {
 		d.next = 0
@@ -301,31 +337,51 @@ func (d *Dialer) SSHClient(ctx context.Context) (*ssh.Client, error) {
 	return sshCli, nil
 }
 
-func (d *Dialer) keepAlive(cli *ssh.Client, interval time.Duration, dead <-chan struct{}) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+// atDeadline runs f at a non-zero deadline; stop prevents that and reports whether it did.
+func atDeadline(deadline time.Time, f func()) (stop func() bool) {
+	if deadline.IsZero() {
+		return func() bool { return true }
+	}
+	return time.AfterFunc(time.Until(deadline), f).Stop
+}
+
+func (d *Dialer) timeoutError() error {
+	return fmt.Errorf("ssh: connecting to %s exceeded the %v timeout: %w", d.host, d.config.Timeout, context.DeadlineExceeded)
+}
+
+func (d *Dialer) keepAlive(cli *ssh.Client, interval time.Duration, record *connRecord) {
+	defer d.closeSSHClient(cli)
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	var replied chan error // non-nil while a probe awaits its reply
+	var arrived int64
 	for {
 		select {
-		case <-dead:
+		case <-record.done():
 			return
-		case <-ticker.C:
-		}
-		replied := make(chan error, 1)
-		go func() {
-			_, _, err := cli.SendRequest("keepalive@openssh.com", true, nil)
-			replied <- err
-		}()
-		select {
 		case err := <-replied:
 			if err != nil {
-				d.closeSSHClient(cli)
 				return
 			}
-		case <-time.After(interval):
-			d.closeSSHClient(cli)
-			return
-		case <-dead:
-			return
+			replied = nil
+		case <-timer.C:
+			n := record.arrived()
+			switch {
+			case record.ended():
+				// SendRequest spins forever on a mux that has shut down.
+				return
+			case replied == nil:
+				replied = make(chan error, 1)
+				go func(replied chan<- error) {
+					_, _, err := cli.SendRequest("keepalive@openssh.com", true, nil)
+					replied <- err
+				}(replied)
+			case n == arrived:
+				// The reply may queue behind data still arriving, so only silence closes.
+				return
+			}
+			arrived = n
+			timer.Reset(interval)
 		}
 	}
 }
